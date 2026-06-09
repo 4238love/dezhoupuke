@@ -89,6 +89,7 @@ function App() {
   });
   const [amount, setAmount] = useState(20);
   const [actionOpen, setActionOpen] = useState(false);
+  const [rosterOpen, setRosterOpen] = useState(false);
   const [countdown, setCountdown] = useState(120);
   const wsRef = useRef<WebSocket | undefined>(undefined);
 
@@ -332,6 +333,18 @@ function App() {
       : playableSeatCount < 2
         ? "等待至少 2 名玩家或 AI 入座"
         : "玩家已到齐，正在开局";
+  const winnerSummaries =
+    snapshot.hand?.awards?.map((award) => {
+      const winner = snapshot.seats.find((seat) => seat.occupant?.id === award.playerId)?.occupant;
+      return {
+        playerId: award.playerId,
+        nickname: winner?.nickname ?? "玩家",
+        amount: award.amount,
+      };
+    }) ?? [];
+  const winnerPlayerIds = new Set(winnerSummaries.map((winner) => winner.playerId));
+  const showWinnerReveal = snapshot.hand?.phase === "settled" && winnerSummaries.length > 0;
+  const occupiedSeatCount = snapshot.seats.filter((seat) => seat.occupant).length;
   const wagerActions = snapshot.legalActions.filter((action) => isWagerAction(action.type));
   const quickActions = snapshot.legalActions.filter((action) => !isWagerAction(action.type));
   const wagerMinimum = wagerActions.reduce<number | undefined>((minimum, action) => {
@@ -416,12 +429,36 @@ function App() {
                 isBigBlind={seat.index === snapshot.hand?.bigBlindSeatIndex}
                 isCurrent={seat.index === snapshot.hand?.currentTurnSeatIndex}
                 isMe={seat.occupant?.id === snapshot.yourPlayerId}
+                isWinner={Boolean(seat.occupant?.id && winnerPlayerIds.has(seat.occupant.id))}
                 isHost={isHost}
                 canRemove={isHost && seat.occupant?.kind === "human" && seat.occupant.id !== snapshot.yourPlayerId}
                 onRemove={() => send("removePlayer", { targetPlayerId: seat.occupant?.id })}
               />
             ))}
           </div>
+
+          {showWinnerReveal && (
+            <div className="winner-reveal" aria-live="polite">
+              <div className="winner-sparks" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+                <span />
+                <span />
+                <span />
+              </div>
+              <p className="eyebrow">Showdown</p>
+              <h2>{winnerSummaries.length > 1 ? "多人分池" : "胜者揭晓"}</h2>
+              <div className="winner-list">
+                {winnerSummaries.map((winner) => (
+                  <strong key={`${winner.playerId}-${winner.amount}`}>
+                    {winner.nickname}
+                    <span>+{winner.amount}</span>
+                  </strong>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         <aside className="side">
@@ -573,6 +610,54 @@ function App() {
           <small>{waitingForStart ? `${connectedHumanCount}/${requiredHumanCount}` : `${countdown}s`}</small>
         </button>
       </div>
+
+      <div className={`roster-fab ${rosterOpen ? "open" : ""}`}>
+        {rosterOpen && (
+          <section className="roster-popover" role="dialog" aria-label="座位列表">
+            <div className="roster-head">
+              <div>
+                <p className="eyebrow">Seats</p>
+                <h2>座位总览</h2>
+              </div>
+              <button className="roster-close" onClick={() => setRosterOpen(false)} aria-label="关闭座位列表">
+                关闭
+              </button>
+            </div>
+            <div className="roster-list">
+              {snapshot.seats.map((seat) => {
+                const tags = [
+                  seat.index === snapshot.hand?.dealerSeatIndex ? "D" : undefined,
+                  seat.index === snapshot.hand?.smallBlindSeatIndex ? "SB" : undefined,
+                  seat.index === snapshot.hand?.bigBlindSeatIndex ? "BB" : undefined,
+                  seat.index === snapshot.hand?.currentTurnSeatIndex ? "行动" : undefined,
+                  seat.folded ? "弃牌" : undefined,
+                  seat.allIn ? "全下" : undefined,
+                  seat.occupant?.id && winnerPlayerIds.has(seat.occupant.id) ? "赢家" : undefined,
+                ].filter((tag): tag is string => Boolean(tag));
+                return (
+                  <div
+                    className={`roster-row ${seat.index === snapshot.hand?.currentTurnSeatIndex ? "current" : ""} ${
+                      seat.occupant?.id === snapshot.yourPlayerId ? "me" : ""
+                    }`}
+                    key={seat.index}
+                  >
+                    <span className="roster-index">{seat.index + 1}</span>
+                    <strong>{seat.occupant?.nickname ?? "空位"}</strong>
+                    <small>{seat.occupant ? `${seat.occupant.chips} 筹码` : "未入座"}</small>
+                    <em>{tags.join(" / ")}</em>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+        <button className="roster-orb" onClick={() => setRosterOpen((open) => !open)} aria-expanded={rosterOpen}>
+          <span>座位</span>
+          <small>
+            {occupiedSeatCount}/{snapshot.seats.length}
+          </small>
+        </button>
+      </div>
     </main>
   );
 }
@@ -585,6 +670,7 @@ function SeatView({
   isBigBlind,
   isCurrent,
   isMe,
+  isWinner,
   canRemove,
   onRemove,
 }: {
@@ -595,6 +681,7 @@ function SeatView({
   isBigBlind: boolean;
   isCurrent: boolean;
   isMe: boolean;
+  isWinner: boolean;
   isHost: boolean;
   canRemove: boolean;
   onRemove: () => void;
@@ -606,7 +693,9 @@ function SeatView({
     (tag): tag is string => Boolean(tag),
   );
   return (
-    <div className={`seat ${isCurrent ? "current" : ""} ${isMe ? "me" : ""}`} style={{ left: `${x}%`, top: `${y}%` }}>
+    <div className={`seat ${isCurrent ? "current" : ""} ${isMe ? "me" : ""} ${isWinner ? "winner" : ""}`} style={{ left: `${x}%`, top: `${y}%` }}>
+      {isCurrent && <div className="turn-badge">行动中</div>}
+      {isWinner && <div className="winner-badge">赢家</div>}
       <div className="seat-cards">
         {seat.occupant ? (
           <>

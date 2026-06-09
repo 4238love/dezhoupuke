@@ -191,7 +191,7 @@ function scheduleRoomWork(roomCode: string): void {
         game.startNextHand(roomCode);
         broadcastRoom(roomCode);
         scheduleRoomWork(roomCode);
-      }, 2500);
+      }, 4500);
       nextHandTimers.set(roomCode, timer);
     }
     return;
