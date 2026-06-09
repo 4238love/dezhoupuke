@@ -1,0 +1,11 @@
+node_modules/
+.npm-cache/
+.codex/
+dist/
+client/dist/
+server/dist/
+.env
+.DS_Store
+npm-debug.log*
+server-runtime*.log
+*.tsbuildinfo

@@ -1,0 +1,13 @@
+node_modules
+node_modules/
+client/node_modules
+server/node_modules
+.npm-cache
+client/dist
+server/dist
+.scratch
+.git
+.env
+npm-debug.log*
+server-runtime*.log
+*.tsbuildinfo

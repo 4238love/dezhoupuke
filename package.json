@@ -1,0 +1,19 @@
+{
+  "name": "texas-holdem-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w server",
+    "build": "npm run build -w client && npm run build -w server",
+    "start": "npm run start -w server",
+    "test": "npm run test -w server",
+    "smoke:ws": "node scripts/smoke-ws.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
