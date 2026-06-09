@@ -13,6 +13,7 @@ type ClientMessage =
   | { type: "joinRoom"; payload: { roomCode: string; nickname: string; sessionId?: string } }
   | { type: "reconnect"; payload: { roomCode: string; playerId?: string; sessionId: string } }
   | { type: "action"; payload: Omit<PlayerActionInput, "roomCode" | "playerId"> }
+  | { type: "startNextHand" }
   | { type: "leave" }
   | { type: "removePlayer"; payload: { targetPlayerId: string } }
   | { type: "endRoom" }
@@ -133,10 +134,23 @@ function handleClientMessage(context: ClientContext, message: ClientMessage): vo
     return;
   }
 
-  if (message.type === "leave") {
-    game.leaveSeat(context.roomCode, context.playerId);
+  if (message.type === "startNextHand") {
+    clearNextHandTimer(context.roomCode);
+    game.startNextHand(context.roomCode);
     broadcastRoom(context.roomCode);
     scheduleRoomWork(context.roomCode);
+    return;
+  }
+
+  if (message.type === "leave") {
+    const roomCode = context.roomCode;
+    game.leaveSeat(roomCode, context.playerId);
+    context.roomCode = undefined;
+    context.playerId = undefined;
+    context.sessionId = undefined;
+    send(context, { type: "leftRoom" });
+    broadcastRoom(roomCode);
+    scheduleRoomWork(roomCode);
     return;
   }
 
@@ -284,6 +298,14 @@ function clearActionTimer(roomCode: string): void {
   if (existing) {
     clearTimeout(existing.timer);
     actionTimers.delete(roomCode);
+  }
+}
+
+function clearNextHandTimer(roomCode: string): void {
+  const existing = nextHandTimers.get(roomCode);
+  if (existing) {
+    clearTimeout(existing);
+    nextHandTimers.delete(roomCode);
   }
 }
 

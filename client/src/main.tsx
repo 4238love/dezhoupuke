@@ -66,6 +66,32 @@ interface Session {
   sessionId: string;
 }
 
+type DraftNumber = number | "";
+
+interface CreateFormState {
+  hostNickname: string;
+  seatCount: DraftNumber;
+  requiredHumanCount: DraftNumber;
+  aiCount: DraftNumber;
+  aiDifficulty: AiDifficulty;
+  initialChips: DraftNumber;
+  smallBlind: DraftNumber;
+  bigBlind: DraftNumber;
+}
+
+interface CreateRoomPayload {
+  hostNickname: string;
+  seatCount: number;
+  requiredHumanCount: number;
+  aiCount: number;
+  aiDifficulty: AiDifficulty;
+  initialChips: number;
+  smallBlind: number;
+  bigBlind: number;
+}
+
+type NumericCreateField = keyof Pick<CreateFormState, "seatCount" | "requiredHumanCount" | "aiCount" | "initialChips" | "smallBlind" | "bigBlind">;
+
 const sessionKey = "texas-holdem-session";
 
 function App() {
@@ -73,7 +99,7 @@ function App() {
   const [session, setSession] = useState<Session | undefined>(() => readSession());
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState("");
-  const [createForm, setCreateForm] = useState({
+  const [createForm, setCreateForm] = useState<CreateFormState>({
     hostNickname: "玩家",
     seatCount: 6,
     requiredHumanCount: 2,
@@ -83,6 +109,7 @@ function App() {
     smallBlind: 5,
     bigBlind: 10,
   });
+  const normalizedCreateForm = normalizeCreateForm(createForm);
   const [joinForm, setJoinForm] = useState({
     roomCode: new URLSearchParams(location.search).get("room") ?? "",
     nickname: "朋友",
@@ -129,6 +156,12 @@ function App() {
         setSnapshot(undefined);
         setError("房间已销毁");
       }
+      if (message.type === "leftRoom") {
+        localStorage.removeItem(sessionKey);
+        setSession(undefined);
+        setSnapshot(undefined);
+        setError("已退出房间，原席位由 AI 接管");
+      }
     });
     return () => ws.close();
   }, []);
@@ -167,7 +200,9 @@ function App() {
   }
 
   function createRoom() {
-    send("createRoom", createForm);
+    const payload = normalizeCreateForm(createForm);
+    setCreateForm(payload);
+    send("createRoom", payload);
   }
 
   function joinRoom() {
@@ -176,6 +211,24 @@ function App() {
 
   function act(type: PlayerActionType, actionAmount = amount) {
     send("action", { action: type, amount: isWagerAction(type) ? actionAmount : undefined });
+  }
+
+  function leaveRoom() {
+    send("leave");
+  }
+
+  function continueNextHand() {
+    setActionOpen(false);
+    send("startNextHand");
+  }
+
+  function updateCreateNumber(field: NumericCreateField, raw: string) {
+    const draftValue = parseDraftNumber(raw);
+    setCreateForm((form) => normalizeCreateDraft({ ...form, [field]: draftValue }, field));
+  }
+
+  function settleCreateNumbers() {
+    setCreateForm((form) => normalizeCreateForm(form));
   }
 
   function submitAction(action: RoomSnapshot["legalActions"][number]) {
@@ -215,29 +268,24 @@ function App() {
                   座位数
                   <input
                     type="number"
+                    inputMode="numeric"
                     min={2}
                     max={9}
                     value={createForm.seatCount}
-                    onChange={(event) => {
-                      const seatCount = clampInteger(Number(event.target.value), 2, 9);
-                      const requiredHumanCount = clampInteger(createForm.requiredHumanCount, 1, seatCount);
-                      const aiCount = clampInteger(createForm.aiCount, 0, seatCount - requiredHumanCount);
-                      setCreateForm({ ...createForm, seatCount, requiredHumanCount, aiCount });
-                    }}
+                    onChange={(event) => updateCreateNumber("seatCount", event.target.value)}
+                    onBlur={settleCreateNumbers}
                   />
                 </label>
                 <label>
                   真实玩家数
                   <input
                     type="number"
+                    inputMode="numeric"
                     min={1}
-                    max={createForm.seatCount}
+                    max={normalizedCreateForm.seatCount}
                     value={createForm.requiredHumanCount}
-                    onChange={(event) => {
-                      const requiredHumanCount = clampInteger(Number(event.target.value), 1, createForm.seatCount);
-                      const aiCount = clampInteger(createForm.aiCount, 0, createForm.seatCount - requiredHumanCount);
-                      setCreateForm({ ...createForm, requiredHumanCount, aiCount });
-                    }}
+                    onChange={(event) => updateCreateNumber("requiredHumanCount", event.target.value)}
+                    onBlur={settleCreateNumbers}
                   />
                   <small className="field-hint">含房主，满员后自动开局</small>
                 </label>
@@ -245,15 +293,12 @@ function App() {
                   AI 数量
                   <input
                     type="number"
+                    inputMode="numeric"
                     min={0}
-                    max={createForm.seatCount - createForm.requiredHumanCount}
+                    max={normalizedCreateForm.seatCount - normalizedCreateForm.requiredHumanCount}
                     value={createForm.aiCount}
-                    onChange={(event) =>
-                      setCreateForm({
-                        ...createForm,
-                        aiCount: clampInteger(Number(event.target.value), 0, createForm.seatCount - createForm.requiredHumanCount),
-                      })
-                    }
+                    onChange={(event) => updateCreateNumber("aiCount", event.target.value)}
+                    onBlur={settleCreateNumbers}
                   />
                 </label>
               </div>
@@ -273,24 +318,33 @@ function App() {
                   初始筹码
                   <input
                     type="number"
+                    inputMode="numeric"
+                    min={1}
                     value={createForm.initialChips}
-                    onChange={(event) => setCreateForm({ ...createForm, initialChips: Number(event.target.value) })}
+                    onChange={(event) => updateCreateNumber("initialChips", event.target.value)}
+                    onBlur={settleCreateNumbers}
                   />
                 </label>
                 <label>
                   小盲
                   <input
                     type="number"
+                    inputMode="numeric"
+                    min={1}
                     value={createForm.smallBlind}
-                    onChange={(event) => setCreateForm({ ...createForm, smallBlind: Number(event.target.value) })}
+                    onChange={(event) => updateCreateNumber("smallBlind", event.target.value)}
+                    onBlur={settleCreateNumbers}
                   />
                 </label>
                 <label>
                   大盲
                   <input
                     type="number"
+                    inputMode="numeric"
+                    min={2}
                     value={createForm.bigBlind}
-                    onChange={(event) => setCreateForm({ ...createForm, bigBlind: Number(event.target.value) })}
+                    onChange={(event) => updateCreateNumber("bigBlind", event.target.value)}
+                    onBlur={settleCreateNumbers}
                   />
                 </label>
               </div>
@@ -368,10 +422,10 @@ function App() {
           <h1>房间 {snapshot.roomCode}</h1>
         </div>
         <div className="top-actions">
+          <button className="leave-top-button danger" onClick={leaveRoom}>退出房间</button>
           <button onClick={() => void navigator.clipboard?.writeText(snapshot.roomCode)}>复制房间码</button>
           <button onClick={() => void navigator.clipboard?.writeText(inviteLink)}>复制邀请链接</button>
           {isHost && <button onClick={() => send("endRoom")}>结束房间</button>}
-          <button onClick={() => send("leave")}>退出并由 AI 接管</button>
         </div>
       </header>
 
@@ -457,6 +511,7 @@ function App() {
                   </strong>
                 ))}
               </div>
+              <button className="primary winner-continue" onClick={continueNextHand}>继续下一手</button>
             </div>
           )}
         </div>
@@ -465,7 +520,7 @@ function App() {
           <section className="panel status-panel">
             <p className="eyebrow">Your seat</p>
             <h2>{me?.nickname ?? "等待入座"}</h2>
-            <p>筹码：{me?.chips ?? 0}</p>
+            <p>筹码：{formatChips(me?.chips ?? 0)}</p>
             <p>盲注：{snapshot.settings.smallBlind}/{snapshot.settings.bigBlind}</p>
             <p>真实玩家：{connectedHumanCount}/{requiredHumanCount}</p>
             <p>AI 难度：{difficultyText(snapshot.settings.aiDifficulty)}</p>
@@ -537,6 +592,8 @@ function App() {
           </section>
         </aside>
       </section>
+
+      <button className="mobile-leave-fab danger" onClick={leaveRoom}>退出房间</button>
 
       <div className={`wager-fab ${actionOpen ? "open" : ""}`}>
         {actionOpen && (
@@ -643,7 +700,7 @@ function App() {
                   >
                     <span className="roster-index">{seat.index + 1}</span>
                     <strong>{seat.occupant?.nickname ?? "空位"}</strong>
-                    <small>{seat.occupant ? `${seat.occupant.chips} 筹码` : "未入座"}</small>
+                    <small>{seat.occupant ? `筹码 ${formatChips(seat.occupant.chips)}` : "未入座"}</small>
                     <em>{tags.join(" / ")}</em>
                   </div>
                 );
@@ -711,7 +768,7 @@ function SeatView({
         {seat.occupant?.takeover && <span className="takeover">接管</span>}
       </div>
       <div className="seat-meta">
-        <span>{seat.occupant ? `${seat.occupant.chips} 筹码` : "未入座"}</span>
+        <span className="chip-count">{seat.occupant ? `筹码 ${formatChips(seat.occupant.chips)}` : "未入座"}</span>
         {tags.map((tag) => (
           <b key={tag}>{tag}</b>
         ))}
@@ -733,10 +790,96 @@ function CardView({ card, hidden }: { card?: Card; hidden?: boolean }) {
   const red = card.suit === "H" || card.suit === "D";
   return (
     <span className={`card ${red ? "red" : "black"}`}>
-      {card.rank}
+      <span className="card-rank">{rankLabel(card.rank)}</span>
       <small>{suitSymbol(card.suit)}</small>
     </span>
   );
+}
+
+function rankLabel(rank: string): string {
+  const labels: Record<string, string> = {
+    "1": "A",
+    T: "10",
+    "10": "10",
+    "11": "J",
+    "12": "Q",
+    "13": "K",
+    "14": "A",
+  };
+  return labels[rank] ?? rank;
+}
+
+function parseDraftNumber(raw: string): DraftNumber {
+  if (raw.trim() === "") {
+    return "";
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : "";
+}
+
+function numberOrDefault(value: DraftNumber, fallback: number): number {
+  return value === "" || !Number.isFinite(value) ? fallback : value;
+}
+
+function normalizeCreateDraft(form: CreateFormState, changedField: NumericCreateField): CreateFormState {
+  if (changedField === "seatCount" && form.seatCount !== "") {
+    const seatCount = clampInteger(form.seatCount, 2, 9);
+    const requiredHumanCount =
+      form.requiredHumanCount === "" ? "" : clampInteger(form.requiredHumanCount, 1, seatCount);
+    const aiMax = Math.max(0, seatCount - numberOrDefault(requiredHumanCount, 1));
+    const aiCount = form.aiCount === "" ? "" : clampInteger(form.aiCount, 0, aiMax);
+    return { ...form, seatCount, requiredHumanCount, aiCount };
+  }
+
+  if (changedField === "requiredHumanCount" && form.requiredHumanCount !== "") {
+    const seatCount = clampInteger(numberOrDefault(form.seatCount, 6), 2, 9);
+    const requiredHumanCount = clampInteger(form.requiredHumanCount, 1, seatCount);
+    const aiCount = form.aiCount === "" ? "" : clampInteger(form.aiCount, 0, seatCount - requiredHumanCount);
+    return { ...form, requiredHumanCount, aiCount };
+  }
+
+  if (changedField === "aiCount" && form.aiCount !== "") {
+    const seatCount = clampInteger(numberOrDefault(form.seatCount, 6), 2, 9);
+    const requiredHumanCount = clampInteger(numberOrDefault(form.requiredHumanCount, 1), 1, seatCount);
+    return { ...form, aiCount: clampInteger(form.aiCount, 0, seatCount - requiredHumanCount) };
+  }
+
+  if (changedField === "initialChips" && form.initialChips !== "") {
+    return { ...form, initialChips: clampInteger(form.initialChips, 1, 1_000_000_000) };
+  }
+
+  if (changedField === "smallBlind" && form.smallBlind !== "") {
+    const smallBlind = clampInteger(form.smallBlind, 1, 1_000_000_000);
+    const bigBlind = form.bigBlind === "" ? "" : Math.max(smallBlind + 1, form.bigBlind);
+    return { ...form, smallBlind, bigBlind };
+  }
+
+  if (changedField === "bigBlind" && form.bigBlind !== "") {
+    const smallBlind = clampInteger(numberOrDefault(form.smallBlind, 5), 1, 1_000_000_000);
+    return { ...form, bigBlind: clampInteger(form.bigBlind, smallBlind + 1, 1_000_000_000) };
+  }
+
+  return form;
+}
+
+function normalizeCreateForm(form: CreateFormState): CreateRoomPayload {
+  const seatCount = clampInteger(numberOrDefault(form.seatCount, 6), 2, 9);
+  const requiredHumanCount = clampInteger(numberOrDefault(form.requiredHumanCount, 1), 1, seatCount);
+  const aiCount = clampInteger(numberOrDefault(form.aiCount, 0), 0, seatCount - requiredHumanCount);
+  const initialChips = clampInteger(numberOrDefault(form.initialChips, 1000), 1, 1_000_000_000);
+  const smallBlind = clampInteger(numberOrDefault(form.smallBlind, 5), 1, 1_000_000_000);
+  const bigBlind = clampInteger(numberOrDefault(form.bigBlind, Math.max(10, smallBlind + 1)), smallBlind + 1, 1_000_000_000);
+
+  return {
+    hostNickname: form.hostNickname,
+    seatCount,
+    requiredHumanCount,
+    aiCount,
+    aiDifficulty: form.aiDifficulty,
+    initialChips,
+    smallBlind,
+    bigBlind,
+  };
 }
 
 function clampInteger(value: number, min: number, max: number): number {
@@ -745,6 +888,10 @@ function clampInteger(value: number, min: number, max: number): number {
     return min;
   }
   return Math.min(Math.max(Math.floor(value), min), safeMax);
+}
+
+function formatChips(value: number): string {
+  return Math.max(0, value).toLocaleString("zh-CN");
 }
 
 function readSession(): Session | undefined {

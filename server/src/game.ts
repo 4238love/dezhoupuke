@@ -569,7 +569,9 @@ export class GameService {
     this.applyPendingReplacements(room);
     const seated = room.seats.filter((seat) => seat.occupant && seat.occupant.chips > 0 && !seat.occupant.waitingForRebuy);
     const onlineHumans = seated.filter((seat) => seat.occupant?.kind === "human" && seat.occupant.connected);
-    if (seated.length < 2 || onlineHumans.length < room.requiredHumanCount) {
+    const waitingForFirstHand = room.handNumber === 0;
+    const requiredOnlineHumans = waitingForFirstHand ? room.requiredHumanCount : 1;
+    if (seated.length < 2 || onlineHumans.length < requiredOnlineHumans) {
       return;
     }
 

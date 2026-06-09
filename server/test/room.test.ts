@@ -138,6 +138,30 @@ describe("Private Room lifecycle", () => {
     assert.equal(seat?.occupant?.chips, 2222);
   });
 
+  it("continues to the next Hand after a human leaves and becomes an AI Takeover Seat", () => {
+    const game = new GameService({ roomCodeGenerator: () => "ROOM08", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 3,
+      requiredHumanCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+    const firstHandId = joined.snapshot.hand?.id;
+
+    game.leaveSeat(created.roomCode, joined.playerId);
+    game.finishCurrentHandForTest(created.roomCode);
+    const next = game.startNextHand(created.roomCode);
+
+    assert.equal(next.hand?.phase, "preflop");
+    assert.notEqual(next.hand?.id, firstHandId);
+    assert.equal(next.seats.filter((seat) => seat.occupant && seat.occupant.chips > 0).length, 3);
+  });
+
   it("auto-folds on Action Timeout when checking is not possible", () => {
     const game = new GameService({ roomCodeGenerator: () => "ROOM06", idGenerator: sequentialIds() });
     const created = game.createRoom({
