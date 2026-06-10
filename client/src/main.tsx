@@ -6,6 +6,7 @@ type Rank = "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "T" | "J" | "Q" | "K
 type Suit = "S" | "H" | "D" | "C";
 type AiDifficulty = "easy" | "standard" | "hard";
 type PlayerActionType = "fold" | "check" | "call" | "bet" | "raise" | "all-in" | "rebuy";
+type SoundCue = "tap" | "deal" | "turn" | "win" | "pause" | PlayerActionType;
 
 interface Card {
   rank: Rank;
@@ -34,6 +35,7 @@ interface RoomSnapshot {
   roomCode: string;
   hostPlayerId: string;
   yourPlayerId?: string;
+  paused: boolean;
   settings: {
     requiredHumanCount: number;
     aiDifficulty: AiDifficulty;
@@ -93,12 +95,14 @@ interface CreateRoomPayload {
 type NumericCreateField = keyof Pick<CreateFormState, "seatCount" | "requiredHumanCount" | "aiCount" | "initialChips" | "smallBlind" | "bigBlind">;
 
 const sessionKey = "texas-holdem-session";
+const soundKey = "texas-holdem-sound-enabled";
 
 function App() {
   const [snapshot, setSnapshot] = useState<RoomSnapshot | undefined>();
   const [session, setSession] = useState<Session | undefined>(() => readSession());
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState("");
+  const [soundEnabled, setSoundEnabled] = useState(() => readSoundEnabled());
   const [createForm, setCreateForm] = useState<CreateFormState>({
     hostNickname: "玩家",
     seatCount: 6,
@@ -119,6 +123,22 @@ function App() {
   const [rosterOpen, setRosterOpen] = useState(false);
   const [countdown, setCountdown] = useState(120);
   const wsRef = useRef<WebSocket | undefined>(undefined);
+  const audioRef = useRef<AudioContext | undefined>(undefined);
+  const soundEnabledRef = useRef(soundEnabled);
+  const previousSoundStateRef = useRef<{
+    seen: boolean;
+    handId?: string;
+    phase?: string;
+    turnKey?: string;
+    settledHandId?: string;
+    paused?: boolean;
+    tableLog?: string[];
+  }>({ seen: false });
+
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+    localStorage.setItem(soundKey, soundEnabled ? "1" : "0");
+  }, [soundEnabled]);
 
   useEffect(() => {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -176,14 +196,14 @@ function App() {
   const turnKey = `${snapshot?.hand?.id ?? "none"}:${snapshot?.hand?.currentTurnSeatIndex ?? "none"}:${snapshot?.hand?.currentBet ?? 0}`;
   useEffect(() => {
     setCountdown(120);
-    if (!snapshot?.hand || snapshot.hand.phase === "settled" || snapshot.hand.currentTurnSeatIndex === undefined) {
+    if (!snapshot?.hand || snapshot.paused || snapshot.hand.phase === "settled" || snapshot.hand.currentTurnSeatIndex === undefined) {
       return;
     }
     const timer = window.setInterval(() => {
       setCountdown((value) => Math.max(0, value - 1));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [turnKey, snapshot?.hand?.phase]);
+  }, [turnKey, snapshot?.hand?.phase, snapshot?.paused]);
 
   useEffect(() => {
     if (!snapshot?.hand || snapshot.hand.phase === "settled") {
@@ -191,12 +211,65 @@ function App() {
     }
   }, [snapshot?.hand?.id, snapshot?.hand?.phase]);
 
-  function send(type: string, payload?: unknown) {
+  useEffect(() => {
+    const hand = snapshot?.hand;
+    const currentSeat = hand?.currentTurnSeatIndex === undefined ? undefined : snapshot?.seats[hand.currentTurnSeatIndex];
+    const currentTurnKey = hand && hand.currentTurnSeatIndex !== undefined ? `${hand.id}:${hand.currentTurnSeatIndex}:${hand.currentBet}` : undefined;
+    const currentState = {
+      seen: true,
+      handId: hand?.id,
+      phase: hand?.phase,
+      turnKey: currentTurnKey,
+      settledHandId: hand?.phase === "settled" ? hand.id : undefined,
+      paused: snapshot?.paused,
+      tableLog: snapshot?.tableLog ?? [],
+    };
+    const previous = previousSoundStateRef.current;
+
+    if (snapshot && previous.seen && soundEnabledRef.current) {
+      const ownNickname = snapshot.seats.find((seat) => seat.occupant?.id === snapshot.yourPlayerId)?.occupant?.nickname;
+      const latestAction = getNewLogEntries(previous.tableLog ?? [], snapshot.tableLog)
+        .map((line) => actionFromTableLog(line, ownNickname))
+        .filter((type): type is PlayerActionType => Boolean(type))
+        .pop();
+      if (latestAction) {
+        playActionSound(audioRef, latestAction, true, false);
+      }
+
+      if (previous.paused !== undefined && previous.paused !== snapshot.paused) {
+        playSoundCue(audioRef, "pause", true, false);
+      } else if (hand?.phase === "settled" && hand.awards?.length && previous.settledHandId !== hand.id) {
+        playSoundCue(audioRef, "win", true, false);
+      } else if (hand?.id && previous.handId && previous.handId !== hand.id) {
+        playSoundCue(audioRef, "deal", true, false);
+      } else if (hand?.phase && previous.phase && previous.phase !== hand.phase && hand.phase !== "settled") {
+        playSoundCue(audioRef, "deal", true, false);
+      } else if (currentTurnKey && previous.turnKey !== currentTurnKey && currentSeat?.occupant?.id === snapshot.yourPlayerId) {
+        playSoundCue(audioRef, "turn", true, false);
+      }
+    }
+
+    previousSoundStateRef.current = currentState;
+  }, [snapshot]);
+
+  function send(type: string, payload?: unknown, options: { tap?: boolean } = {}) {
     if (wsRef.current?.readyState !== WebSocket.OPEN) {
       setError("WebSocket 未连接");
       return;
     }
+    if (options.tap ?? true) {
+      playSoundCue(audioRef, "tap", soundEnabledRef.current);
+    }
     wsRef.current.send(JSON.stringify({ type, payload }));
+  }
+
+  function toggleSound() {
+    const nextEnabled = !soundEnabled;
+    soundEnabledRef.current = nextEnabled;
+    setSoundEnabled(nextEnabled);
+    if (nextEnabled) {
+      playSoundCue(audioRef, "turn", true);
+    }
   }
 
   function createRoom() {
@@ -210,7 +283,8 @@ function App() {
   }
 
   function act(type: PlayerActionType, actionAmount = amount) {
-    send("action", { action: type, amount: isWagerAction(type) ? actionAmount : undefined });
+    playActionSound(audioRef, type, soundEnabledRef.current);
+    send("action", { action: type, amount: isWagerAction(type) ? actionAmount : undefined }, { tap: false });
   }
 
   function leaveRoom() {
@@ -220,6 +294,11 @@ function App() {
   function continueNextHand() {
     setActionOpen(false);
     send("startNextHand");
+  }
+
+  function setPaused(paused: boolean) {
+    setActionOpen(false);
+    send("setPaused", { paused });
   }
 
   function updateCreateNumber(field: NumericCreateField, raw: string) {
@@ -386,11 +465,21 @@ function App() {
   const currentSeat = snapshot.hand?.currentTurnSeatIndex === undefined ? undefined : snapshot.seats[snapshot.hand.currentTurnSeatIndex];
   const isMyTurn = currentSeat?.occupant?.id === snapshot.yourPlayerId;
   const isHost = snapshot.yourPlayerId === snapshot.hostPlayerId;
+  const isPaused = snapshot.paused;
+  const canAct = isMyTurn && !isPaused;
   const mySeat = snapshot.seats.find((seat) => seat.occupant?.id === snapshot.yourPlayerId);
   const requiredHumanCount = snapshot.settings.requiredHumanCount ?? 1;
   const connectedHumanCount = snapshot.seats.filter((seat) => seat.occupant?.kind === "human" && seat.occupant.connected).length;
   const playableSeatCount = snapshot.seats.filter((seat) => seat.occupant && seat.occupant.chips > 0 && !seat.occupant.waitingForRebuy).length;
   const waitingForStart = !snapshot.hand;
+  const waitingRebuySeats = snapshot.seats.filter(
+    (seat) => seat.occupant?.kind === "human" && seat.occupant.connected && seat.occupant.waitingForRebuy,
+  );
+  const needsMyRebuy = Boolean(mySeat?.occupant?.waitingForRebuy);
+  const needsRebuyDecision = snapshot.hand?.phase === "settled" && waitingRebuySeats.length > 0;
+  const rebuyNames = waitingRebuySeats.map((seat) => seat.occupant?.nickname ?? "玩家").join("、");
+  const rebuyDecisionMessage = `等待 ${rebuyNames} 选择重新买入或退出后，房主才能继续下一手。`;
+  const pausedMessage = isHost ? "游戏已暂停，点击“恢复游戏”继续。" : "游戏已暂停，等待房主恢复。";
   const waitingMessage =
     connectedHumanCount < requiredHumanCount
       ? `等待真实玩家 ${connectedHumanCount}/${requiredHumanCount}`
@@ -404,10 +493,15 @@ function App() {
         playerId: award.playerId,
         nickname: winner?.nickname ?? "玩家",
         amount: award.amount,
+        chips: winner?.chips,
       };
     }) ?? [];
   const winnerPlayerIds = new Set(winnerSummaries.map((winner) => winner.playerId));
   const showWinnerReveal = snapshot.hand?.phase === "settled" && winnerSummaries.length > 0;
+  const settledAmount = winnerSummaries.reduce((sum, winner) => sum + winner.amount, 0);
+  const isSettled = snapshot.hand?.phase === "settled";
+  const potLabel = isSettled ? "已结算" : "底池";
+  const potAmount = isSettled ? settledAmount : snapshot.hand?.pot ?? 0;
   const occupiedSeatCount = snapshot.seats.filter((seat) => seat.occupant).length;
   const wagerActions = snapshot.legalActions.filter((action) => isWagerAction(action.type));
   const quickActions = snapshot.legalActions.filter((action) => !isWagerAction(action.type));
@@ -437,12 +531,22 @@ function App() {
           <button className="leave-top-button danger" onClick={leaveRoom}>退出房间</button>
           <button onClick={() => void navigator.clipboard?.writeText(snapshot.roomCode)}>复制房间码</button>
           <button onClick={() => void navigator.clipboard?.writeText(inviteLink)}>复制邀请链接</button>
-          {isHost && <button onClick={() => send("endRoom")}>结束房间</button>}
+          <button className={`sound-toggle ${soundEnabled ? "active" : ""}`} onClick={toggleSound} aria-pressed={soundEnabled}>
+            {soundEnabled ? "音效开" : "音效关"}
+          </button>
+          {isHost && snapshot.hand?.phase !== "settled" && (
+            <button className={isPaused ? "primary" : ""} onClick={() => setPaused(!isPaused)}>
+              {isPaused ? "恢复游戏" : "暂停游戏"}
+            </button>
+          )}
+          {isHost && <button onClick={() => send("endRoom")}>结束对局</button>}
         </div>
       </header>
 
       {error && <div className="error floating">{error}</div>}
       {snapshot.pendingReplacement && <div className="notice">你将在本手结束后替换一个 AI 入座。</div>}
+      {isPaused && <div className="notice pause-banner">{pausedMessage}</div>}
+      {needsRebuyDecision && <div className="notice rebuy-banner">{rebuyDecisionMessage}</div>}
       {waitingForStart && <div className="notice waiting-banner">{waitingMessage}，满员后自动开始第一手。</div>}
 
       <section className="mobile-summary" aria-label="手机端牌局摘要">
@@ -451,8 +555,8 @@ function App() {
           <strong>{phaseText(snapshot.hand?.phase)}</strong>
         </div>
         <div>
-          <span>底池</span>
-          <strong>{snapshot.hand?.pot ?? 0}</strong>
+          <span>{potLabel}</span>
+          <strong>{potAmount}</strong>
         </div>
         <div>
           <span>{snapshot.hand ? "行动" : "真人"}</span>
@@ -460,7 +564,7 @@ function App() {
         </div>
         <div>
           <span>{snapshot.hand ? "倒计时" : "状态"}</span>
-          <strong>{snapshot.hand ? `${countdown}s` : "等待"}</strong>
+          <strong>{needsRebuyDecision ? "补码" : isPaused ? "暂停" : snapshot.hand ? `${countdown}s` : "等待"}</strong>
         </div>
       </section>
 
@@ -473,7 +577,7 @@ function App() {
                 <CardView key={index} card={snapshot.hand?.communityCards[index]} />
               ))}
             </div>
-            <div className="pot">底池 {snapshot.hand?.pot ?? 0}</div>
+            <div className="pot">{potLabel} {potAmount}</div>
             {waitingForStart && <div className="waiting-copy">{waitingMessage}</div>}
             {snapshot.hand?.awards && (
               <div className="awards">
@@ -518,12 +622,30 @@ function App() {
               <div className="winner-list">
                 {winnerSummaries.map((winner) => (
                   <strong key={`${winner.playerId}-${winner.amount}`}>
-                    {winner.nickname}
-                    <span>+{winner.amount}</span>
+                    <span className="winner-name">{winner.nickname}</span>
+                    <span className="winner-amount">+{winner.amount}</span>
+                    {winner.chips !== undefined && <small>当前筹码 {formatChips(winner.chips)}</small>}
                   </strong>
                 ))}
               </div>
-              <button className="primary winner-continue" onClick={continueNextHand}>继续下一手</button>
+              {needsRebuyDecision && (
+                <div className="rebuy-decision">
+                  <strong>{rebuyDecisionMessage}</strong>
+                  {needsMyRebuy && (
+                    <button className="primary" onClick={() => act("rebuy")}>
+                      重新买入 {formatChips(snapshot.settings.initialChips)}
+                    </button>
+                  )}
+                </div>
+              )}
+              {isHost ? (
+                <div className="winner-controls">
+                  <button className="primary winner-continue" onClick={continueNextHand} disabled={needsRebuyDecision}>继续下一手</button>
+                  <button className="danger winner-continue" onClick={() => send("endRoom")}>结束对局</button>
+                </div>
+              ) : (
+                <p className="winner-host-note">{needsRebuyDecision ? "筹码为 0 的玩家请先选择重新买入或退出。" : "等待房主选择继续下一手或结束对局。"}</p>
+              )}
             </div>
           )}
         </div>
@@ -536,15 +658,21 @@ function App() {
             <p>盲注：{snapshot.settings.smallBlind}/{snapshot.settings.bigBlind}</p>
             <p>真实玩家：{connectedHumanCount}/{requiredHumanCount}</p>
             <p>AI 难度：{difficultyText(snapshot.settings.aiDifficulty)}</p>
-            <p>当前行动：{currentSeat?.occupant?.nickname ?? "无"}</p>
+            <p>当前行动：{isPaused ? "已暂停" : currentSeat?.occupant?.nickname ?? "无"}</p>
+            {isPaused && <p className="thinking">{pausedMessage}</p>}
+            {needsRebuyDecision && <p className="thinking">{rebuyDecisionMessage}</p>}
             {waitingForStart && <p className="thinking">{waitingMessage}</p>}
-            {currentSeat?.occupant?.kind === "ai" && <p className="thinking">AI 思考中...</p>}
-            {mySeat?.occupant?.waitingForRebuy && <button className="primary" onClick={() => act("rebuy")}>重新买入</button>}
+            {!isPaused && currentSeat?.occupant?.kind === "ai" && <p className="thinking">AI 思考中...</p>}
+            {needsMyRebuy && (
+              <button className="primary" onClick={() => act("rebuy")}>
+                重新买入 {formatChips(snapshot.settings.initialChips)}
+              </button>
+            )}
           </section>
 
-          <section className="panel action-panel">
+          <section className={`panel action-panel ${canAct ? "mobile-action-visible" : ""}`}>
             <p className="eyebrow">Action</p>
-            <h2>{isMyTurn ? "轮到你行动" : "等待其他玩家"}</h2>
+            <h2>{isPaused ? "游戏已暂停" : isMyTurn ? "轮到你行动" : "等待其他玩家"}</h2>
             <div className="amount-row inline-wager-control">
               <label>
                 下注/加注到
@@ -566,13 +694,13 @@ function App() {
                     onClick={() => {
                       submitAction(action);
                     }}
-                    disabled={!isMyTurn}
+                    disabled={!canAct}
                   >
                     {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                   </button>
                 ))
               ) : wagerActions.length === 0 ? (
-                <span className="no-actions">{waitingForStart ? waitingMessage : "等待当前玩家行动"}</span>
+                <span className="no-actions">{isPaused ? pausedMessage : waitingForStart ? waitingMessage : "等待当前玩家行动"}</span>
               ) : null}
             </div>
             <div className="action-buttons mobile-quick-actions">
@@ -582,7 +710,7 @@ function App() {
                     key={action.type}
                     className={action.type === "all-in" ? "danger" : ""}
                     onClick={() => submitAction(action)}
-                    disabled={!isMyTurn}
+                    disabled={!canAct}
                   >
                     {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                   </button>
@@ -590,11 +718,13 @@ function App() {
               ) : wagerActions.length > 0 ? (
                 <span className="no-actions">点右侧筹码球打开{wagerOrbLabel}浮窗</span>
               ) : (
-                <span className="no-actions">{waitingForStart ? waitingMessage : "等待当前玩家行动"}</span>
+                <span className="no-actions">{isPaused ? pausedMessage : waitingForStart ? waitingMessage : "等待当前玩家行动"}</span>
               )}
             </div>
             {wagerActions.length > 0 && <div className="mobile-wager-hint">右侧筹码球可调整{wagerOrbLabel}金额。</div>}
-            <div className={`timer ${countdown <= 15 ? "urgent" : ""}`}>行动倒计时：{countdown} 秒</div>
+            <div className={`timer ${countdown <= 15 && !isPaused ? "urgent" : ""}`}>
+              {isPaused ? "游戏已暂停" : `行动倒计时：${countdown} 秒`}
+            </div>
           </section>
 
           <section className="panel log-panel">
@@ -619,7 +749,7 @@ function App() {
             <div className="wager-popover-head">
               <div>
                 <p className="eyebrow">Action</p>
-                <h2>{isMyTurn ? "轮到你行动" : "等待其他玩家"}</h2>
+                <h2>{isPaused ? "游戏已暂停" : isMyTurn ? "轮到你行动" : "等待其他玩家"}</h2>
               </div>
               <button className="wager-close" onClick={() => setActionOpen(false)} aria-label="关闭行动浮窗">
                 关闭
@@ -627,9 +757,9 @@ function App() {
             </div>
 
             <div className="floating-action-status">
-              <span>{waitingForStart ? waitingMessage : `当前行动：${currentSeat?.occupant?.nickname ?? "无"}`}</span>
-              <span className={countdown <= 15 && !waitingForStart ? "urgent" : ""}>
-                {waitingForStart ? "满员自动开局" : `倒计时：${countdown} 秒`}
+              <span>{isPaused ? pausedMessage : waitingForStart ? waitingMessage : `当前行动：${currentSeat?.occupant?.nickname ?? "无"}`}</span>
+              <span className={countdown <= 15 && !waitingForStart && !isPaused ? "urgent" : ""}>
+                {isPaused ? "暂停中" : waitingForStart ? "满员自动开局" : `倒计时：${countdown} 秒`}
               </span>
             </div>
 
@@ -640,13 +770,13 @@ function App() {
                     key={action.type}
                     className={action.type === "all-in" ? "danger" : ""}
                     onClick={() => submitAction(action)}
-                    disabled={!isMyTurn}
+                    disabled={!canAct}
                   >
                     {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                   </button>
                 ))
               ) : (
-                <span className="no-actions">{waitingForStart ? waitingMessage : "等待当前玩家行动"}</span>
+                <span className="no-actions">{isPaused ? pausedMessage : waitingForStart ? waitingMessage : "等待当前玩家行动"}</span>
               )}
             </div>
 
@@ -666,7 +796,7 @@ function App() {
                     max={wagerMaximum}
                     value={amount}
                     onChange={(event) => setWagerAmount(Number(event.target.value))}
-                    disabled={!isMyTurn}
+                    disabled={!canAct}
                   />
                 </label>
                 {wagerMinimum !== undefined && (
@@ -677,14 +807,14 @@ function App() {
                 )}
                 <div className="wager-presets" aria-label="下注快捷金额">
                   {wagerPresets.map((preset) => (
-                    <button key={`${preset.label}-${preset.value}`} type="button" onClick={() => setWagerAmount(preset.value)} disabled={!isMyTurn}>
+                    <button key={`${preset.label}-${preset.value}`} type="button" onClick={() => setWagerAmount(preset.value)} disabled={!canAct}>
                       {preset.label}
                     </button>
                   ))}
                 </div>
                 <div className="wager-popover-actions">
                   {wagerActions.map((action) => (
-                    <button className="primary" key={action.type} onClick={() => submitAction(action)} disabled={!isMyTurn}>
+                    <button className="primary" key={action.type} onClick={() => submitAction(action)} disabled={!canAct}>
                       {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                     </button>
                   ))}
@@ -693,9 +823,16 @@ function App() {
             )}
           </section>
         )}
-        <button className={`wager-orb ${isMyTurn ? "active" : "idle"}`} onClick={toggleWagerPanel} aria-expanded={actionOpen}>
-          <span>{isMyTurn ? "行动" : waitingForStart ? "等待" : "状态"}</span>
-          <small>{waitingForStart ? `${connectedHumanCount}/${requiredHumanCount}` : `${countdown}s`}</small>
+        <button
+          className={`wager-orb ${canAct ? "active" : "idle"}`}
+          onClick={(event) => {
+            event.currentTarget.blur();
+            toggleWagerPanel();
+          }}
+          aria-expanded={actionOpen}
+        >
+          <span>{canAct ? "行动" : isPaused ? "暂停" : waitingForStart ? "等待" : "状态"}</span>
+          <small>{isPaused ? "暂停" : waitingForStart ? `${connectedHumanCount}/${requiredHumanCount}` : `${countdown}s`}</small>
         </button>
       </div>
 
@@ -739,7 +876,14 @@ function App() {
             </div>
           </section>
         )}
-        <button className="roster-orb" onClick={() => setRosterOpen((open) => !open)} aria-expanded={rosterOpen}>
+        <button
+          className="roster-orb"
+          onClick={(event) => {
+            event.currentTarget.blur();
+            setRosterOpen((open) => !open);
+          }}
+          aria-expanded={rosterOpen}
+        >
           <span>座位</span>
           <small>
             {occupiedSeatCount}/{snapshot.seats.length}
@@ -953,6 +1097,211 @@ function readSession(): Session | undefined {
   } catch {
     return undefined;
   }
+}
+
+function readSoundEnabled(): boolean {
+  try {
+    return localStorage.getItem(soundKey) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+function playActionSound(
+  audioRef: React.MutableRefObject<AudioContext | undefined>,
+  action: PlayerActionType,
+  enabled = true,
+  createIfMissing = true,
+): void {
+  playSoundCue(audioRef, action, enabled, createIfMissing);
+  speakActionPhrase(audioRef, actionPhrase(action), enabled, createIfMissing);
+}
+
+function playSoundCue(audioRef: React.MutableRefObject<AudioContext | undefined>, cue: SoundCue, enabled = true, createIfMissing = true): void {
+  if (!enabled) {
+    return;
+  }
+  const context = getAudioContext(audioRef, createIfMissing);
+  if (!context) {
+    return;
+  }
+  const play = () => scheduleSoundCue(context, cue);
+  if (context.state === "suspended") {
+    void context.resume().then(play).catch(() => undefined);
+    return;
+  }
+  play();
+}
+
+function getAudioContext(audioRef: React.MutableRefObject<AudioContext | undefined>, createIfMissing = true): AudioContext | undefined {
+  if (audioRef.current && audioRef.current.state !== "closed") {
+    return audioRef.current;
+  }
+  if (!createIfMissing) {
+    return undefined;
+  }
+  const audioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextConstructor = window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextConstructor) {
+    return undefined;
+  }
+  audioRef.current = new AudioContextConstructor();
+  return audioRef.current;
+}
+
+function speakActionPhrase(
+  audioRef: React.MutableRefObject<AudioContext | undefined>,
+  phrase: string | undefined,
+  enabled = true,
+  createIfMissing = true,
+): void {
+  if (!enabled || !phrase || !("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+    return;
+  }
+  if (!createIfMissing && !audioRef.current) {
+    return;
+  }
+  const utterance = new SpeechSynthesisUtterance(phrase);
+  const zhVoice = window.speechSynthesis
+    .getVoices()
+    .find((voice) => voice.lang.toLowerCase().startsWith("zh"));
+  if (zhVoice) {
+    utterance.voice = zhVoice;
+  }
+  utterance.lang = "zh-CN";
+  utterance.rate = phrase === "梭哈" ? 1.05 : 1.28;
+  utterance.pitch = phrase === "梭哈" ? 0.82 : 1.08;
+  utterance.volume = phrase === "梭哈" ? 0.95 : 0.82;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+}
+
+function scheduleSoundCue(context: AudioContext, cue: SoundCue): void {
+  const now = context.currentTime;
+  if (cue === "tap") {
+    playTone(context, { start: now, duration: 0.055, frequency: 520, endFrequency: 360, volume: 0.028, type: "triangle" });
+    return;
+  }
+  if (cue === "deal") {
+    playTone(context, { start: now, duration: 0.07, frequency: 260, endFrequency: 420, volume: 0.032, type: "square" });
+    playTone(context, { start: now + 0.055, duration: 0.06, frequency: 320, endFrequency: 480, volume: 0.026, type: "triangle" });
+    return;
+  }
+  if (cue === "turn") {
+    playTone(context, { start: now, duration: 0.11, frequency: 740, endFrequency: 880, volume: 0.035, type: "sine" });
+    return;
+  }
+  if (cue === "win") {
+    [523.25, 659.25, 783.99].forEach((frequency, index) => {
+      playTone(context, { start: now + index * 0.08, duration: 0.16, frequency, volume: 0.034, type: "sine" });
+    });
+    return;
+  }
+  if (cue === "all-in") {
+    playTone(context, { start: now, duration: 0.13, frequency: 170, endFrequency: 92, volume: 0.06, type: "sawtooth" });
+    playTone(context, { start: now + 0.08, duration: 0.18, frequency: 420, endFrequency: 620, volume: 0.035, type: "square" });
+    return;
+  }
+  if (cue === "call") {
+    playTone(context, { start: now, duration: 0.075, frequency: 330, endFrequency: 390, volume: 0.032, type: "triangle" });
+    return;
+  }
+  if (cue === "raise") {
+    playTone(context, { start: now, duration: 0.07, frequency: 390, endFrequency: 610, volume: 0.034, type: "square" });
+    playTone(context, { start: now + 0.055, duration: 0.06, frequency: 610, endFrequency: 760, volume: 0.026, type: "triangle" });
+    return;
+  }
+  if (cue === "bet") {
+    playTone(context, { start: now, duration: 0.08, frequency: 260, endFrequency: 320, volume: 0.036, type: "square" });
+    return;
+  }
+  if (cue === "check") {
+    playTone(context, { start: now, duration: 0.055, frequency: 440, endFrequency: 440, volume: 0.024, type: "sine" });
+    return;
+  }
+  if (cue === "fold") {
+    playTone(context, { start: now, duration: 0.11, frequency: 320, endFrequency: 160, volume: 0.028, type: "triangle" });
+    return;
+  }
+  if (cue === "rebuy") {
+    playTone(context, { start: now, duration: 0.08, frequency: 520, endFrequency: 660, volume: 0.03, type: "sine" });
+    playTone(context, { start: now + 0.06, duration: 0.09, frequency: 660, endFrequency: 780, volume: 0.026, type: "sine" });
+    return;
+  }
+  playTone(context, { start: now, duration: 0.12, frequency: 360, endFrequency: 250, volume: 0.03, type: "triangle" });
+}
+
+function actionPhrase(action: PlayerActionType): string | undefined {
+  const phrases: Record<PlayerActionType, string> = {
+    fold: "弃",
+    check: "过",
+    call: "跟",
+    bet: "下",
+    raise: "加",
+    "all-in": "梭哈",
+    rebuy: "补码",
+  };
+  return phrases[action];
+}
+
+function actionFromTableLog(line: string, ownNickname?: string): PlayerActionType | undefined {
+  if (ownNickname && line.startsWith(`${ownNickname} `)) {
+    return undefined;
+  }
+  if (line.includes("全下")) return "all-in";
+  if (line.includes("跟注")) return "call";
+  if (line.includes("加注到")) return "raise";
+  if (line.includes("下注")) return "bet";
+  if (line.includes("过牌")) return "check";
+  if (line.includes("弃牌")) return "fold";
+  if (line.includes("重新买入")) return "rebuy";
+  return undefined;
+}
+
+function getNewLogEntries(previous: string[], current: string[]): string[] {
+  if (previous.length === 0) {
+    return current;
+  }
+  const maxOverlap = Math.min(previous.length, current.length);
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    if (sameStrings(previous.slice(previous.length - size), current.slice(0, size))) {
+      return current.slice(size);
+    }
+  }
+  const lastPrevious = previous[previous.length - 1];
+  const lastPreviousIndex = current.lastIndexOf(lastPrevious);
+  return lastPreviousIndex >= 0 ? current.slice(lastPreviousIndex + 1) : current;
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function playTone(
+  context: AudioContext,
+  options: {
+    start: number;
+    duration: number;
+    frequency: number;
+    endFrequency?: number;
+    volume: number;
+    type: OscillatorType;
+  },
+): void {
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  oscillator.type = options.type;
+  oscillator.frequency.setValueAtTime(options.frequency, options.start);
+  if (options.endFrequency) {
+    oscillator.frequency.exponentialRampToValueAtTime(options.endFrequency, options.start + options.duration);
+  }
+  gain.gain.setValueAtTime(0.0001, options.start);
+  gain.gain.exponentialRampToValueAtTime(options.volume, options.start + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, options.start + options.duration);
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start(options.start);
+  oscillator.stop(options.start + options.duration + 0.03);
 }
 
 function actionText(type: PlayerActionType, callAmount?: number, minAmount?: number, availableChips?: number): string {

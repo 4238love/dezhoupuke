@@ -277,6 +277,138 @@ describe("Private Room lifecycle", () => {
     assert.equal(friendView.tableLog.some((line) => line.includes("朋友 成为新房主")), true);
   });
 
+  it("lets only the Host pause and resume active gameplay", () => {
+    const game = new GameService({ roomCodeGenerator: () => "PAUSE1", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+
+    const paused = game.setPaused(created.roomCode, created.playerId, true);
+    assert.equal(paused.paused, true);
+    assert.equal(paused.legalActions.length, 0);
+    assert.throws(
+      () => game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "call" }),
+      /游戏已暂停/,
+    );
+    assert.equal(game.currentAiDecisionContext(created.roomCode), undefined);
+    assert.equal(game.performAiAction(created.roomCode), false);
+
+    const resumed = game.setPaused(created.roomCode, created.playerId, false);
+    assert.equal(resumed.paused, false);
+    assert.ok(resumed.legalActions.length > 0);
+  });
+
+  it("rejects non-Host pause and next-hand controls", () => {
+    const game = new GameService({ roomCodeGenerator: () => "HOST02", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    assert.throws(() => game.setPaused(created.roomCode, joined.playerId, true), /只有房主/);
+
+    game.finishCurrentHandForTest(created.roomCode);
+    assert.throws(() => game.startNextHand(created.roomCode, joined.playerId), /只有房主/);
+
+    const next = game.startNextHand(created.roomCode, created.playerId);
+    assert.equal(next.hand?.phase, "preflop");
+  });
+
+  it("waits for busted humans to rebuy or leave before the Host starts the next Hand", () => {
+    const game = new GameService({ roomCodeGenerator: () => "REBUY1", idGenerator: sequentialIds(), random: () => 0.29 });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 10,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    const settled = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "call" });
+    assert.equal(settled.hand?.phase, "settled");
+    assert.equal(settled.seats.find((seat) => seat.occupant?.id === joined.playerId)?.occupant?.waitingForRebuy, true);
+
+    assert.throws(() => game.startNextHand(created.roomCode, created.playerId), /等待玩家重新买入或退出/);
+
+    const afterRebuy = game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "rebuy" });
+    assert.equal(afterRebuy.hand?.phase, "settled");
+    assert.equal(afterRebuy.seats.find((seat) => seat.occupant?.id === joined.playerId)?.occupant?.waitingForRebuy, false);
+
+    const next = game.startNextHand(created.roomCode, created.playerId);
+    assert.equal(next.hand?.phase, "preflop");
+    assert.notEqual(next.hand?.id, settled.hand?.id);
+  });
+
+  it("does not award the Pot twice if settlement is triggered again", () => {
+    const game = new GameService({ roomCodeGenerator: () => "IDEMP1", idGenerator: sequentialIds(), random: () => 0.29 });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "call" });
+    game.finishCurrentHandForTest(created.roomCode);
+    const once = game.snapshot(created.roomCode, created.playerId);
+    assert.equal(once.hand?.phase, "settled");
+    assert.equal(once.hand?.pot, 0);
+    const onceStacks = once.seats.map((seat) => seat.occupant?.chips ?? 0);
+    const onceAwards = once.hand?.awards;
+
+    game.finishCurrentHandForTest(created.roomCode);
+    const twice = game.snapshot(created.roomCode, joined.playerId);
+    const twiceStacks = twice.seats.map((seat) => seat.occupant?.chips ?? 0);
+
+    assert.deepEqual(twiceStacks, onceStacks);
+    assert.deepEqual(twice.hand?.awards, onceAwards);
+  });
+
+  it("keeps total Table Chips conserved after a fold settlement without rebuy", () => {
+    const game = new GameService({ roomCodeGenerator: () => "CHIPS1", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    const settled = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "fold" });
+    const stacks = settled.seats.map((seat) => seat.occupant?.chips ?? 0);
+
+    assert.equal(settled.hand?.phase, "settled");
+    assert.equal(settled.hand?.pot, 0);
+    assert.deepEqual(stacks, [995, 1005]);
+    assert.equal(stacks.reduce((sum, chips) => sum + chips, 0), 2000);
+  });
+
   it("auto-folds on Action Timeout when checking is not possible", () => {
     const game = new GameService({ roomCodeGenerator: () => "ROOM06", idGenerator: sequentialIds() });
     const created = game.createRoom({

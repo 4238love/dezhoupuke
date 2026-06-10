@@ -14,6 +14,7 @@ type ClientMessage =
   | { type: "reconnect"; payload: { roomCode: string; playerId?: string; sessionId: string } }
   | { type: "action"; payload: Omit<PlayerActionInput, "roomCode" | "playerId"> }
   | { type: "startNextHand" }
+  | { type: "setPaused"; payload: { paused: boolean } }
   | { type: "leave" }
   | { type: "removePlayer"; payload: { targetPlayerId: string } }
   | { type: "endRoom" }
@@ -31,7 +32,6 @@ const config = readServerConfig();
 const game = new GameService();
 const clients = new Set<ClientContext>();
 const aiTimers = new Map<string, NodeJS.Timeout>();
-const nextHandTimers = new Map<string, NodeJS.Timeout>();
 const actionTimers = new Map<string, { key: string; timer: NodeJS.Timeout }>();
 const aiRuntimeStats = {
   apiAttempts: 0,
@@ -135,8 +135,14 @@ function handleClientMessage(context: ClientContext, message: ClientMessage): vo
   }
 
   if (message.type === "startNextHand") {
-    clearNextHandTimer(context.roomCode);
-    game.startNextHand(context.roomCode);
+    game.startNextHand(context.roomCode, context.playerId);
+    broadcastRoom(context.roomCode);
+    scheduleRoomWork(context.roomCode);
+    return;
+  }
+
+  if (message.type === "setPaused") {
+    game.setPaused(context.roomCode, context.playerId, Boolean(message.payload.paused));
     broadcastRoom(context.roomCode);
     scheduleRoomWork(context.roomCode);
     return;
@@ -197,17 +203,9 @@ function scheduleRoomWork(roomCode: string): void {
       ? `${roomView.hand.id}:${currentSeatIndex}:${roomView.hand.currentBet}:${currentSeat?.roundBet ?? 0}`
       : "";
 
-  if (roomView.hand?.phase === "settled") {
+  if (roomView.paused || roomView.hand?.phase === "settled") {
     clearActionTimer(roomCode);
-    if (!nextHandTimers.has(roomCode)) {
-      const timer = setTimeout(() => {
-        nextHandTimers.delete(roomCode);
-        game.startNextHand(roomCode);
-        broadcastRoom(roomCode);
-        scheduleRoomWork(roomCode);
-      }, 4500);
-      nextHandTimers.set(roomCode, timer);
-    }
+    clearAiTimer(roomCode);
     return;
   }
 
@@ -293,19 +291,19 @@ async function performScheduledAiAction(roomCode: string): Promise<void> {
   }
 }
 
+function clearAiTimer(roomCode: string): void {
+  const existing = aiTimers.get(roomCode);
+  if (existing) {
+    clearTimeout(existing);
+    aiTimers.delete(roomCode);
+  }
+}
+
 function clearActionTimer(roomCode: string): void {
   const existing = actionTimers.get(roomCode);
   if (existing) {
     clearTimeout(existing.timer);
     actionTimers.delete(roomCode);
-  }
-}
-
-function clearNextHandTimer(roomCode: string): void {
-  const existing = nextHandTimers.get(roomCode);
-  if (existing) {
-    clearTimeout(existing);
-    nextHandTimers.delete(roomCode);
   }
 }
 

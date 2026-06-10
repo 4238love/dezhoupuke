@@ -111,6 +111,7 @@ interface Room {
   code: string;
   hostPlayerId: string;
   seats: Seat[];
+  paused: boolean;
   requiredHumanCount: number;
   aiDifficulty: AiDifficulty;
   initialChips: number;
@@ -146,6 +147,7 @@ export interface RoomSnapshot {
   roomCode: string;
   hostPlayerId: string;
   yourPlayerId?: string;
+  paused: boolean;
   settings: {
     requiredHumanCount: number;
     aiDifficulty: AiDifficulty;
@@ -212,6 +214,7 @@ export class GameService {
       code,
       hostPlayerId: hostId,
       seats,
+      paused: false,
       requiredHumanCount,
       aiDifficulty: input.aiDifficulty,
       initialChips: input.initialChips,
@@ -317,6 +320,7 @@ export class GameService {
       roomCode,
       hostPlayerId: room.hostPlayerId,
       yourPlayerId: viewerPlayerId,
+      paused: room.paused,
       settings: {
         requiredHumanCount: room.requiredHumanCount,
         aiDifficulty: room.aiDifficulty,
@@ -336,7 +340,10 @@ export class GameService {
             currentTurnSeatIndex: hand.currentTurnSeatIndex,
             currentBet: hand.currentBet,
             minRaise: hand.minRaise,
-            pot: hand.participants.reduce((sum, participant) => sum + participant.contribution, 0),
+            pot:
+              hand.phase === "settled"
+                ? 0
+                : hand.participants.reduce((sum, participant) => sum + participant.contribution, 0),
             awards: hand.awards,
           }
         : undefined,
@@ -359,11 +366,16 @@ export class GameService {
       occupant.chips = room.initialChips;
       occupant.waitingForRebuy = false;
       room.tableLog.push(`${occupant.nickname} 重新买入 ${room.initialChips}`);
-      this.startHandIfReady(room);
+      if (!room.hand || room.hand.phase !== "settled") {
+        this.startHandIfReady(room);
+      }
       return this.snapshot(room.code, input.playerId);
     }
 
     const hand = this.requireActiveHand(room);
+    if (room.paused) {
+      throw new Error("游戏已暂停");
+    }
     const participant = hand.participants.find((item) => item.playerId === input.playerId);
     if (!participant || participant.seatIndex !== hand.currentTurnSeatIndex) {
       throw new Error("还没轮到该玩家行动");
@@ -376,6 +388,9 @@ export class GameService {
 
   timeoutCurrentAction(roomCode: string): RoomSnapshot {
     const room = this.requireRoom(roomCode);
+    if (room.paused) {
+      return this.snapshot(roomCode);
+    }
     const hand = this.requireActiveHand(room);
     const participant = hand.participants.find((item) => item.seatIndex === hand.currentTurnSeatIndex);
     if (!participant) {
@@ -389,14 +404,39 @@ export class GameService {
     return this.snapshot(roomCode);
   }
 
-  startNextHand(roomCode: string): RoomSnapshot {
+  startNextHand(roomCode: string, hostPlayerId?: string): RoomSnapshot {
     const room = this.requireRoom(roomCode);
+    if (hostPlayerId && room.hostPlayerId !== hostPlayerId) {
+      throw new Error("只有房主可以继续下一手");
+    }
+    if (room.paused) {
+      throw new Error("游戏已暂停，请先恢复游戏");
+    }
+    const waitingRebuyNames = waitingRebuyHumans(room);
+    if (room.hand?.phase === "settled" && waitingRebuyNames.length > 0) {
+      throw new Error(`等待玩家重新买入或退出：${waitingRebuyNames.join("、")}`);
+    }
     this.startHandIfReady(room);
-    return this.snapshot(roomCode);
+    return this.snapshot(roomCode, hostPlayerId);
+  }
+
+  setPaused(roomCode: string, hostPlayerId: string, paused: boolean): RoomSnapshot {
+    const room = this.requireRoom(roomCode);
+    if (room.hostPlayerId !== hostPlayerId) {
+      throw new Error("只有房主可以暂停或恢复游戏");
+    }
+    if (room.paused !== paused) {
+      room.paused = paused;
+      room.tableLog.push(paused ? "房主暂停了游戏" : "房主恢复了游戏");
+    }
+    return this.snapshot(roomCode, hostPlayerId);
   }
 
   currentAiDecisionContext(roomCode: string): AiDecisionContext | undefined {
     const room = this.requireRoom(roomCode);
+    if (room.paused) {
+      return undefined;
+    }
     const hand = room.hand;
     if (!hand || hand.phase === "settled" || hand.currentTurnSeatIndex === undefined) {
       return undefined;
@@ -430,6 +470,9 @@ export class GameService {
 
   performAiAction(roomCode: string, decision?: AiActionDecision): boolean {
     const room = this.requireRoom(roomCode);
+    if (room.paused) {
+      return false;
+    }
     const hand = room.hand;
     if (!hand || hand.phase === "settled" || hand.currentTurnSeatIndex === undefined) {
       return false;
@@ -562,6 +605,9 @@ export class GameService {
   }
 
   private startHandIfReady(room: Room): void {
+    if (room.paused) {
+      return;
+    }
     if (room.hand && room.hand.phase !== "settled") {
       return;
     }
@@ -622,7 +668,7 @@ export class GameService {
 
   private legalActions(room: Room, participant: HandParticipant): RoomSnapshot["legalActions"] {
     const hand = room.hand;
-    if (!hand || hand.phase === "settled" || hand.currentTurnSeatIndex !== participant.seatIndex) {
+    if (room.paused || !hand || hand.phase === "settled" || hand.currentTurnSeatIndex !== participant.seatIndex) {
       return [];
     }
     const occupant = this.findOccupant(room, participant.playerId);
@@ -807,6 +853,10 @@ export class GameService {
   }
 
   private settleHand(room: Room, hand: HandState): void {
+    if (hand.phase === "settled") {
+      return;
+    }
+
     while (hand.communityCards.length < 5 && hand.participants.filter((participant) => !participant.folded).length > 1) {
       hand.communityCards.push(draw(hand.deck));
     }
@@ -1013,6 +1063,12 @@ function validateCreateRoom(input: CreateRoomInput): void {
 
 function normalizeRequiredHumanCount(input: CreateRoomInput): number {
   return Math.floor(input.requiredHumanCount ?? 1);
+}
+
+function waitingRebuyHumans(room: Room): string[] {
+  return room.seats
+    .filter((seat) => seat.occupant?.kind === "human" && seat.occupant.connected && seat.occupant.waitingForRebuy)
+    .map((seat) => seat.occupant?.nickname ?? "玩家");
 }
 
 function postBlind(room: Room, hand: HandState, seatIndex: number, amount: number): void {
