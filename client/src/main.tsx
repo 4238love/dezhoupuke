@@ -97,12 +97,21 @@ type NumericCreateField = keyof Pick<CreateFormState, "seatCount" | "requiredHum
 const sessionKey = "texas-holdem-session";
 const soundKey = "texas-holdem-sound-enabled";
 
+interface AudioDeviceProfile {
+  webAudio: boolean;
+  speech: boolean;
+  vibration: boolean;
+  touchLike: boolean;
+  voiceReady: boolean;
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<RoomSnapshot | undefined>();
   const [session, setSession] = useState<Session | undefined>(() => readSession());
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState("");
   const [soundEnabled, setSoundEnabled] = useState(() => readSoundEnabled());
+  const [audioDeviceLabel, setAudioDeviceLabel] = useState(() => audioDeviceSummary(readAudioDeviceProfile()));
   const [createForm, setCreateForm] = useState<CreateFormState>({
     hostNickname: "玩家",
     seatCount: 6,
@@ -139,6 +148,25 @@ function App() {
     soundEnabledRef.current = soundEnabled;
     localStorage.setItem(soundKey, soundEnabled ? "1" : "0");
   }, [soundEnabled]);
+
+  useEffect(() => {
+    const refreshAudioProfile = () => setAudioDeviceLabel(audioDeviceSummary(readAudioDeviceProfile()));
+    const unlockAudio = () => {
+      primeAudioDevice(audioRef, soundEnabledRef.current);
+      refreshAudioProfile();
+    };
+    refreshAudioProfile();
+    window.addEventListener("pointerdown", unlockAudio, { passive: true });
+    window.addEventListener("touchstart", unlockAudio, { passive: true });
+    window.addEventListener("keydown", unlockAudio);
+    window.speechSynthesis?.addEventListener("voiceschanged", refreshAudioProfile);
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio);
+      window.removeEventListener("touchstart", unlockAudio);
+      window.removeEventListener("keydown", unlockAudio);
+      window.speechSynthesis?.removeEventListener("voiceschanged", refreshAudioProfile);
+    };
+  }, []);
 
   useEffect(() => {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -268,6 +296,8 @@ function App() {
     soundEnabledRef.current = nextEnabled;
     setSoundEnabled(nextEnabled);
     if (nextEnabled) {
+      primeAudioDevice(audioRef, true);
+      setAudioDeviceLabel(audioDeviceSummary(readAudioDeviceProfile()));
       playSoundCue(audioRef, "turn", true);
     }
   }
@@ -531,7 +561,12 @@ function App() {
           <button className="leave-top-button danger" onClick={leaveRoom}>退出房间</button>
           <button onClick={() => void navigator.clipboard?.writeText(snapshot.roomCode)}>复制房间码</button>
           <button onClick={() => void navigator.clipboard?.writeText(inviteLink)}>复制邀请链接</button>
-          <button className={`sound-toggle ${soundEnabled ? "active" : ""}`} onClick={toggleSound} aria-pressed={soundEnabled}>
+          <button
+            className={`sound-toggle ${soundEnabled ? "active" : ""}`}
+            onClick={toggleSound}
+            aria-pressed={soundEnabled}
+            title={`设备自动适应：${audioDeviceLabel}`}
+          >
             {soundEnabled ? "音效开" : "音效关"}
           </button>
           {isHost && snapshot.hand?.phase !== "settled" && (
@@ -1107,14 +1142,55 @@ function readSoundEnabled(): boolean {
   }
 }
 
+function readAudioDeviceProfile(): AudioDeviceProfile {
+  const audioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const vibrationNavigator = navigator as Navigator & { vibrate?: (pattern: number | number[]) => boolean };
+  return {
+    webAudio: Boolean(window.AudioContext ?? audioWindow.webkitAudioContext),
+    speech: "speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined",
+    vibration: typeof vibrationNavigator.vibrate === "function",
+    touchLike: window.matchMedia?.("(pointer: coarse)").matches ?? false,
+    voiceReady: "speechSynthesis" in window ? window.speechSynthesis.getVoices().length > 0 : false,
+  };
+}
+
+function audioDeviceSummary(profile: AudioDeviceProfile): string {
+  const modes = [
+    profile.webAudio ? "音调" : undefined,
+    profile.speech ? (profile.voiceReady ? "语音" : "语音待加载") : undefined,
+    profile.vibration && profile.touchLike ? "震动" : undefined,
+  ].filter((mode): mode is string => Boolean(mode));
+  return modes.length > 0 ? modes.join("+") : "当前浏览器不支持音效";
+}
+
+function primeAudioDevice(audioRef: React.MutableRefObject<AudioContext | undefined>, enabled = true): void {
+  if (!enabled) {
+    return;
+  }
+  const context = getAudioContext(audioRef, true);
+  if (context?.state === "suspended") {
+    void context.resume().catch(() => undefined);
+  }
+  warmSpeechVoices();
+}
+
+function warmSpeechVoices(): void {
+  if (!("speechSynthesis" in window)) {
+    return;
+  }
+  window.speechSynthesis.getVoices();
+}
+
 function playActionSound(
   audioRef: React.MutableRefObject<AudioContext | undefined>,
   action: PlayerActionType,
   enabled = true,
   createIfMissing = true,
 ): void {
+  const profile = readAudioDeviceProfile();
   playSoundCue(audioRef, action, enabled, createIfMissing);
-  speakActionPhrase(audioRef, actionPhrase(action), enabled, createIfMissing);
+  speakActionPhrase(audioRef, actionPhrase(action), enabled, createIfMissing, profile);
+  vibrateAction(action, enabled, profile);
 }
 
 function playSoundCue(audioRef: React.MutableRefObject<AudioContext | undefined>, cue: SoundCue, enabled = true, createIfMissing = true): void {
@@ -1154,26 +1230,43 @@ function speakActionPhrase(
   phrase: string | undefined,
   enabled = true,
   createIfMissing = true,
+  profile = readAudioDeviceProfile(),
 ): void {
-  if (!enabled || !phrase || !("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+  if (!enabled || !phrase || !profile.speech) {
     return;
   }
   if (!createIfMissing && !audioRef.current) {
     return;
   }
   const utterance = new SpeechSynthesisUtterance(phrase);
-  const zhVoice = window.speechSynthesis
-    .getVoices()
-    .find((voice) => voice.lang.toLowerCase().startsWith("zh"));
+  const voices = window.speechSynthesis.getVoices();
+  const zhVoice = voices.find((voice) => voice.lang.toLowerCase().startsWith("zh")) ?? voices[0];
   if (zhVoice) {
     utterance.voice = zhVoice;
   }
   utterance.lang = "zh-CN";
-  utterance.rate = phrase === "梭哈" ? 1.05 : 1.28;
+  utterance.rate = phrase === "梭哈" ? (profile.touchLike ? 1 : 1.05) : profile.touchLike ? 1.18 : 1.28;
   utterance.pitch = phrase === "梭哈" ? 0.82 : 1.08;
-  utterance.volume = phrase === "梭哈" ? 0.95 : 0.82;
+  utterance.volume = phrase === "梭哈" ? 0.95 : profile.touchLike ? 0.92 : 0.82;
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
+}
+
+function vibrateAction(action: PlayerActionType, enabled: boolean, profile = readAudioDeviceProfile()): void {
+  if (!enabled || !profile.vibration || !profile.touchLike) {
+    return;
+  }
+  const vibrationNavigator = navigator as Navigator & { vibrate?: (pattern: number | number[]) => boolean };
+  const patterns: Partial<Record<PlayerActionType, number | number[]>> = {
+    fold: 18,
+    check: 12,
+    call: 24,
+    bet: [18, 24, 18],
+    raise: [24, 32, 24],
+    "all-in": [48, 42, 78],
+    rebuy: [20, 30, 20],
+  };
+  vibrationNavigator.vibrate?.(patterns[action] ?? 16);
 }
 
 function scheduleSoundCue(context: AudioContext, cue: SoundCue): void {
