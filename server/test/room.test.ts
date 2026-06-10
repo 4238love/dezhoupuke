@@ -95,6 +95,100 @@ describe("Private Room lifecycle", () => {
     assert.equal(aiSeat?.holeCards, undefined);
   });
 
+  it("reveals community cards in Texas Hold'em street order", () => {
+    const game = new GameService({ roomCodeGenerator: () => "STREET", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    assert.equal(joined.snapshot.hand?.phase, "preflop");
+    assert.equal(joined.snapshot.hand?.communityCards.length, 0);
+
+    const afterSmallBlindCalls = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "call" });
+    assert.equal(afterSmallBlindCalls.hand?.phase, "preflop");
+    assert.equal(afterSmallBlindCalls.hand?.communityCards.length, 0);
+
+    const flop = game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "check" });
+    assert.equal(flop.hand?.phase, "flop");
+    assert.equal(flop.hand?.communityCards.length, 3);
+
+    game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "check" });
+    const turn = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "check" });
+    assert.equal(turn.hand?.phase, "turn");
+    assert.equal(turn.hand?.communityCards.length, 4);
+
+    game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "check" });
+    const river = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "check" });
+    assert.equal(river.hand?.phase, "river");
+    assert.equal(river.hand?.communityCards.length, 5);
+
+    game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "check" });
+    const settled = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "check" });
+    assert.equal(settled.hand?.phase, "settled");
+    assert.equal(settled.hand?.communityCards.length, 5);
+  });
+
+  it("runs out the board after an all-in call leaves no further betting possible", () => {
+    const game = new GameService({ roomCodeGenerator: () => "ALLIN1", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "短码",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "深码" });
+    game.adjustChipsForTest(created.roomCode, created.playerId, 15);
+
+    const allIn = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "all-in" });
+    assert.equal(allIn.hand?.phase, "preflop");
+    assert.equal(allIn.hand?.communityCards.length, 0);
+
+    const settled = game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "call" });
+    assert.equal(settled.hand?.phase, "settled");
+    assert.equal(settled.hand?.communityCards.length, 5);
+    assert.equal(settled.legalActions.length, 0);
+  });
+
+  it("does not offer or accept a raise when the player cannot put in enough chips", () => {
+    const game = new GameService({ roomCodeGenerator: () => "SHORT1", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "短码",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    game.joinRoom({ roomCode: created.roomCode, nickname: "深码" });
+    game.adjustChipsForTest(created.roomCode, created.playerId, 3);
+
+    const shortStackView = game.snapshot(created.roomCode, created.playerId);
+    assert.equal(shortStackView.legalActions.some((action) => action.type === "raise"), false);
+
+    assert.throws(
+      () => game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "raise", amount: 20 }),
+      /筹码不足/,
+    );
+
+    const afterRejectedRaise = game.snapshot(created.roomCode, created.playerId);
+    assert.equal(afterRejectedRaise.hand?.currentBet, 10);
+    assert.equal(afterRejectedRaise.seats.find((seat) => seat.occupant?.id === created.playerId)?.roundBet, 5);
+  });
+
   it("converts Host Removal into an AI Takeover Seat that inherits chips", () => {
     const game = new GameService({ roomCodeGenerator: () => "ROOM04", idGenerator: sequentialIds() });
     const created = game.createRoom({
@@ -160,6 +254,27 @@ describe("Private Room lifecycle", () => {
     assert.equal(next.hand?.phase, "preflop");
     assert.notEqual(next.hand?.id, firstHandId);
     assert.equal(next.seats.filter((seat) => seat.occupant && seat.occupant.chips > 0).length, 3);
+  });
+
+  it("transfers Host controls to a remaining human when the Host leaves", () => {
+    const game = new GameService({ roomCodeGenerator: () => "HOST01", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 3,
+      requiredHumanCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    game.leaveSeat(created.roomCode, created.playerId);
+    const friendView = game.snapshot(created.roomCode, joined.playerId);
+
+    assert.equal(friendView.hostPlayerId, joined.playerId);
+    assert.equal(friendView.tableLog.some((line) => line.includes("朋友 成为新房主")), true);
   });
 
   it("auto-folds on Action Timeout when checking is not possible", () => {

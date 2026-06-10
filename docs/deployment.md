@@ -50,6 +50,7 @@ Notes:
 
 - Keep real API keys in `.env`; `.env` is ignored by git.
 - `.env.example` is safe to commit and only contains placeholders.
+- For DeepSeek, use `POKER_AI_API_BASE_URL=https://api.deepseek.com`; the app normalizes an accidental `/v1` suffix back to the documented DeepSeek API root.
 - If API config is missing or the API call fails, the server falls back to the built-in local poker AI.
 - Health check shows whether AI API settings are present without exposing the API key:
 

@@ -41,11 +41,13 @@ export async function chooseAiActionWithApi(
         model: config.model,
         temperature: 0.2,
         max_tokens: 160,
+        response_format: { type: "json_object" },
+        thinking: { type: "disabled" },
         messages: [
           {
             role: "system",
             content:
-              "You are a Texas Hold'em AI. Return only compact JSON: {\"type\":\"fold|check|call|bet|raise|all-in\",\"amount\":number}. Never include markdown.",
+              "You are a Texas Hold'em AI. Do not reason. Return only compact JSON: {\"type\":\"fold|check|call|bet|raise|all-in\",\"amount\":number}. Never include markdown.",
           },
           {
             role: "user",

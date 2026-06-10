@@ -63,6 +63,9 @@ function normalizeApiBaseUrl(value: string | undefined): string | undefined {
   }
   try {
     const url = new URL(trimmed);
+    if (url.hostname.toLowerCase() === "api.deepseek.com" && (url.pathname === "/" || url.pathname === "/v1")) {
+      return url.origin;
+    }
     if (url.pathname === "" || url.pathname === "/") {
       url.pathname = "/v1";
       return url.toString().replace(/\/+$/, "");

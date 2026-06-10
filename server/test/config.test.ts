@@ -40,4 +40,15 @@ describe("AI API configuration", () => {
 
     assert.equal(config.ai.baseUrl, "https://ai.example.test/v1");
   });
+
+  it("normalizes DeepSeek URLs to the current documented API root", () => {
+    const config = readServerConfig({
+      POKER_AI_ENGINE: "api",
+      POKER_AI_API_BASE_URL: "https://api.deepseek.com/v1",
+      POKER_AI_API_KEY: "secret-key",
+      POKER_AI_API_MODEL: "deepseek-v4-pro",
+    });
+
+    assert.equal(config.ai.baseUrl, "https://api.deepseek.com");
+  });
 });

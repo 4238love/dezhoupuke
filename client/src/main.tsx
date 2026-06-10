@@ -231,12 +231,22 @@ function App() {
     setCreateForm((form) => normalizeCreateForm(form));
   }
 
+  function setWagerAmount(nextAmount: number) {
+    const normalized = Number.isFinite(nextAmount) ? nextAmount : wagerMinimum ?? amount;
+    if (wagerMinimum === undefined) {
+      setAmount(normalized);
+      return;
+    }
+    setAmount(clampInteger(normalized, wagerMinimum, wagerMaximum));
+  }
+
   function submitAction(action: RoomSnapshot["legalActions"][number]) {
     const nextAmount = action.minAmount !== undefined ? Math.max(amount, action.minAmount) : amount;
     if (isWagerAction(action.type)) {
-      setAmount(nextAmount);
+      const boundedAmount = clampInteger(nextAmount, action.minAmount ?? wagerMinimum ?? 0, wagerMaximum);
+      setAmount(boundedAmount);
       setActionOpen(false);
-      act(action.type, nextAmount);
+      act(action.type, boundedAmount);
       return;
     }
     setActionOpen(false);
@@ -405,11 +415,13 @@ function App() {
     if (action.minAmount === undefined) return minimum;
     return minimum === undefined ? action.minAmount : Math.min(minimum, action.minAmount);
   }, undefined);
+  const wagerMaximum = Math.max(wagerMinimum ?? 0, (mySeat?.roundBet ?? 0) + (me?.chips ?? 0));
+  const wagerPresets = makeWagerPresets(wagerMinimum, wagerMaximum, snapshot.settings.bigBlind);
   const wagerOrbLabel = wagerActions.some((action) => action.type === "raise") ? "加注" : "下注";
 
   function toggleWagerPanel() {
     if (!actionOpen && wagerMinimum !== undefined && amount < wagerMinimum) {
-      setAmount(wagerMinimum);
+      setWagerAmount(wagerMinimum);
     }
     setActionOpen((open) => !open);
   }
@@ -536,7 +548,13 @@ function App() {
             <div className="amount-row inline-wager-control">
               <label>
                 下注/加注到
-                <input type="number" value={amount} onChange={(event) => setAmount(Number(event.target.value))} />
+                <input
+                  type="number"
+                  min={wagerMinimum ?? 0}
+                  max={wagerMaximum}
+                  value={amount}
+                  onChange={(event) => setWagerAmount(Number(event.target.value))}
+                />
               </label>
             </div>
             <div className="action-buttons desktop-actions">
@@ -550,7 +568,7 @@ function App() {
                     }}
                     disabled={!isMyTurn}
                   >
-                    {actionText(action.type, action.callAmount, action.minAmount)}
+                    {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                   </button>
                 ))
               ) : wagerActions.length === 0 ? (
@@ -566,7 +584,7 @@ function App() {
                     onClick={() => submitAction(action)}
                     disabled={!isMyTurn}
                   >
-                    {actionText(action.type, action.callAmount, action.minAmount)}
+                    {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                   </button>
                 ))
               ) : wagerActions.length > 0 ? (
@@ -624,7 +642,7 @@ function App() {
                     onClick={() => submitAction(action)}
                     disabled={!isMyTurn}
                   >
-                    {actionText(action.type, action.callAmount, action.minAmount)}
+                    {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                   </button>
                 ))
               ) : (
@@ -645,16 +663,29 @@ function App() {
                   <input
                     type="number"
                     min={wagerMinimum ?? 0}
+                    max={wagerMaximum}
                     value={amount}
-                    onChange={(event) => setAmount(Number(event.target.value))}
+                    onChange={(event) => setWagerAmount(Number(event.target.value))}
                     disabled={!isMyTurn}
                   />
                 </label>
-                {wagerMinimum !== undefined && <div className="wager-minimum">最低需要 {wagerMinimum}</div>}
+                {wagerMinimum !== undefined && (
+                  <div className="wager-range">
+                    <span>最低 {formatChips(wagerMinimum)}</span>
+                    <span>最多 {formatChips(wagerMaximum)}</span>
+                  </div>
+                )}
+                <div className="wager-presets" aria-label="下注快捷金额">
+                  {wagerPresets.map((preset) => (
+                    <button key={`${preset.label}-${preset.value}`} type="button" onClick={() => setWagerAmount(preset.value)} disabled={!isMyTurn}>
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
                 <div className="wager-popover-actions">
                   {wagerActions.map((action) => (
                     <button className="primary" key={action.type} onClick={() => submitAction(action)} disabled={!isMyTurn}>
-                      {actionText(action.type, action.callAmount, action.minAmount)}
+                      {actionText(action.type, action.callAmount, action.minAmount, me?.chips)}
                     </button>
                   ))}
                 </div>
@@ -882,6 +913,27 @@ function normalizeCreateForm(form: CreateFormState): CreateRoomPayload {
   };
 }
 
+function makeWagerPresets(minimum: number | undefined, maximum: number, bigBlind: number): { label: string; value: number }[] {
+  if (minimum === undefined || maximum <= 0) {
+    return [];
+  }
+  const candidates = [
+    { label: "最低", value: minimum },
+    { label: "+1BB", value: minimum + bigBlind },
+    { label: "全下", value: maximum },
+  ];
+  const seen = new Set<number>();
+  return candidates
+    .map((candidate) => ({ ...candidate, value: clampInteger(candidate.value, minimum, maximum) }))
+    .filter((candidate) => {
+      if (seen.has(candidate.value)) {
+        return false;
+      }
+      seen.add(candidate.value);
+      return true;
+    });
+}
+
 function clampInteger(value: number, min: number, max: number): number {
   const safeMax = Math.max(min, max);
   if (!Number.isFinite(value)) {
@@ -903,13 +955,13 @@ function readSession(): Session | undefined {
   }
 }
 
-function actionText(type: PlayerActionType, callAmount?: number, minAmount?: number): string {
+function actionText(type: PlayerActionType, callAmount?: number, minAmount?: number, availableChips?: number): string {
   if (type === "fold") return "弃牌";
   if (type === "check") return "过牌";
-  if (type === "call") return `跟注 ${callAmount ?? ""}`;
+  if (type === "call") return `跟注 ${callAmount ?? ""}${availableChips !== undefined && callAmount !== undefined && callAmount >= availableChips ? "（全下）" : ""}`;
   if (type === "bet") return `下注 ≥ ${minAmount ?? ""}`;
   if (type === "raise") return `加注到 ≥ ${minAmount ?? ""}`;
-  if (type === "all-in") return "全下";
+  if (type === "all-in") return availableChips !== undefined ? `全下 ${formatChips(availableChips)}` : "全下";
   return "重新买入";
 }
 

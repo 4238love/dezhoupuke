@@ -1530,9 +1530,24 @@ label {
     font-size: 0.78rem;
   }
 
-  .wager-minimum {
+  .wager-range {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
     color: var(--gold);
     font-size: 0.84rem;
+  }
+
+  .wager-presets {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.42rem;
+  }
+
+  .wager-presets button {
+    min-height: 38px;
+    padding: 0.45rem 0.35rem;
+    font-size: 0.8rem;
   }
 
   .wager-popover-actions {

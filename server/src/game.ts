@@ -638,10 +638,12 @@ export class GameService {
       ];
     }
     const minRaiseTo = hand.currentBet + hand.minRaise;
+    const maximum = participant.roundBet + occupant.chips;
+    const raiseAction = maximum >= minRaiseTo ? [{ type: "raise" as const, minAmount: minRaiseTo }] : [];
     return [
       { type: "fold" },
       { type: "call", callAmount: Math.min(toCall, occupant.chips) },
-      { type: "raise", minAmount: minRaiseTo },
+      ...raiseAction,
       { type: "all-in" },
     ];
   }
@@ -707,6 +709,9 @@ export class GameService {
       if (raiseTo <= hand.currentBet) {
         throw new Error("加注后金额必须高于当前下注");
       }
+      if (raiseTo > participant.roundBet + occupant.chips) {
+        throw new Error("筹码不足，不能加注到该金额");
+      }
       const raiseSize = raiseTo - hand.currentBet;
       const payAmount = raiseTo - participant.roundBet;
       if (raiseSize < hand.minRaise && payAmount < occupant.chips) {
@@ -763,8 +768,9 @@ export class GameService {
   }
 
   private advancePhase(room: Room, hand: HandState): void {
-    const canAct = hand.participants.filter((participant) => !participant.folded && !participant.allIn).length;
-    if (canAct === 0) {
+    const active = hand.participants.filter((participant) => !participant.folded);
+    const canAct = active.filter((participant) => !participant.allIn).length;
+    if (canAct <= 1 && active.length > 1) {
       while (hand.communityCards.length < 5) {
         hand.communityCards.push(draw(hand.deck));
       }
@@ -867,7 +873,20 @@ export class GameService {
     if (participant) {
       participant.playerId = seat.occupant.id;
     }
+    this.transferHostIfNeeded(room, playerId);
     room.tableLog.push(`${reason}：席位由 AI 接管并继承筹码`);
+  }
+
+  private transferHostIfNeeded(room: Room, leavingPlayerId: string): void {
+    if (room.hostPlayerId !== leavingPlayerId) {
+      return;
+    }
+    const nextHost = room.seats.find((seat) => seat.occupant?.kind === "human" && seat.occupant.connected)?.occupant;
+    if (!nextHost) {
+      return;
+    }
+    room.hostPlayerId = nextHost.id;
+    room.tableLog.push(`${nextHost.nickname} 成为新房主`);
   }
 
   private applyPendingReplacements(room: Room): void {
