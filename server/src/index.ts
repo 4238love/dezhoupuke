@@ -97,6 +97,7 @@ function handleClientMessage(context: ClientContext, message: ClientMessage): vo
   }
 
   if (message.type === "createRoom") {
+    ensureContextIsUnbound(context);
     const result = game.createRoom(message.payload);
     bindContext(context, result.roomCode, result.playerId, result.sessionId);
     send(context, { type: "session", roomCode: result.roomCode, playerId: result.playerId, sessionId: result.sessionId });
@@ -106,6 +107,7 @@ function handleClientMessage(context: ClientContext, message: ClientMessage): vo
   }
 
   if (message.type === "joinRoom") {
+    ensureContextIsUnbound(context);
     const result = game.joinRoom(message.payload);
     bindContext(context, result.roomCode, result.playerId, result.sessionId);
     send(context, { type: "session", roomCode: result.roomCode, playerId: result.playerId, sessionId: result.sessionId });
@@ -184,6 +186,12 @@ function bindContext(context: ClientContext, roomCode: string, playerId: string,
   context.roomCode = roomCode;
   context.playerId = playerId;
   context.sessionId = sessionId;
+}
+
+function ensureContextIsUnbound(context: ClientContext): void {
+  if (context.roomCode || context.playerId) {
+    throw new Error("已在房间中，请先离开当前房间");
+  }
 }
 
 function broadcastRoom(roomCode: string): void {

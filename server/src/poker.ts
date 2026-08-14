@@ -26,6 +26,7 @@ export interface EvaluatedHand {
 
 export interface PotContestant {
   playerId: string;
+  seatIndex: number;
   contribution: number;
   folded: boolean;
   cards: Card[];
@@ -111,7 +112,7 @@ export function compareEvaluatedHands(left: EvaluatedHand, right: EvaluatedHand)
   return 0;
 }
 
-export function settlePots(players: PotContestant[], communityCards: Card[]): PotAward[] {
+export function settlePots(players: PotContestant[], communityCards: Card[], dealerSeatIndex: number): PotAward[] {
   const levels = [...new Set(players.map((player) => player.contribution).filter((amount) => amount > 0))].sort(
     (a, b) => a - b,
   );
@@ -133,12 +134,15 @@ export function settlePots(players: PotContestant[], communityCards: Card[]): Po
 
     const ranked = eligible.map((player) => ({
       playerId: player.playerId,
+      seatIndex: player.seatIndex,
       hand: evaluateBestHand([...player.cards, ...communityCards]),
     }));
     ranked.sort((a, b) => compareEvaluatedHands(b.hand, a.hand));
 
     const best = ranked[0].hand;
-    const winners = ranked.filter((candidate) => compareEvaluatedHands(candidate.hand, best) === 0);
+    const winners = ranked
+      .filter((candidate) => compareEvaluatedHands(candidate.hand, best) === 0)
+      .sort((left, right) => compareSeatsFromDealer(left.seatIndex, right.seatIndex, dealerSeatIndex));
     const share = Math.floor(potAmount / winners.length);
     let remainder = potAmount % winners.length;
 
@@ -150,6 +154,15 @@ export function settlePots(players: PotContestant[], communityCards: Card[]): Po
   }
 
   return [...awards.entries()].map(([playerId, amount]) => ({ playerId, amount }));
+}
+
+function compareSeatsFromDealer(left: number, right: number, dealerSeatIndex: number): number {
+  const leftWrapsPastDealer = left <= dealerSeatIndex;
+  const rightWrapsPastDealer = right <= dealerSeatIndex;
+  if (leftWrapsPastDealer !== rightWrapsPastDealer) {
+    return leftWrapsPastDealer ? 1 : -1;
+  }
+  return left - right;
 }
 
 function evaluateFiveCards(cards: Card[]): EvaluatedHand {

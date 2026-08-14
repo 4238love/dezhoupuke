@@ -23,6 +23,54 @@ describe("Private Room lifecycle", () => {
     assert.equal(result.snapshot.yourPlayerId, result.playerId);
   });
 
+  it("limits initial Table Chips to 50 through 200 big blinds", () => {
+    for (const initialChips of [500, 2000]) {
+      const game = new GameService({ roomCodeGenerator: () => `STACK${initialChips}`, idGenerator: sequentialIds() });
+      assert.doesNotThrow(() =>
+        game.createRoom({
+          hostNickname: "房主",
+          seatCount: 2,
+          aiCount: 1,
+          aiDifficulty: "standard",
+          initialChips,
+          smallBlind: 5,
+          bigBlind: 10,
+        }),
+      );
+    }
+
+    const game = new GameService({ roomCodeGenerator: () => "STACKX", idGenerator: sequentialIds() });
+    for (const initialChips of [499, 2001]) {
+      assert.throws(
+        () =>
+          game.createRoom({
+            hostNickname: "房主",
+            seatCount: 2,
+            aiCount: 1,
+            aiDifficulty: "standard",
+            initialChips,
+            smallBlind: 5,
+            bigBlind: 10,
+          }),
+        /50 到 200 个大盲/,
+      );
+    }
+
+    assert.throws(
+      () =>
+        game.createRoom({
+          hostNickname: "房主",
+          seatCount: 9,
+          aiCount: 8,
+          aiDifficulty: "standard",
+          initialChips: 9_007_199_254_740_900,
+          smallBlind: 1,
+          bigBlind: 90_071_992_547_409,
+        }),
+      /安全结算范围/,
+    );
+  });
+
   it("waits for the configured real player count before starting a Hand", () => {
     const game = new GameService({ roomCodeGenerator: () => "WAIT01", idGenerator: sequentialIds() });
 
@@ -47,7 +95,7 @@ describe("Private Room lifecycle", () => {
     assert.equal(joined.snapshot.seats.filter((seat) => seat.occupant?.kind === "human").length, 2);
   });
 
-  it("lets a friend replace an AI without inheriting AI Table Chips", () => {
+  it("lets a friend replace an AI while preserving the Seat's Table Chips", () => {
     const game = new GameService({ roomCodeGenerator: () => "ROOM02", idGenerator: sequentialIds() });
     const created = game.createRoom({
       hostNickname: "房主",
@@ -61,18 +109,129 @@ describe("Private Room lifecycle", () => {
 
     const aiSeat = created.snapshot.seats.find((seat) => seat.occupant?.kind === "ai");
     assert.ok(aiSeat?.occupant);
+    game.finishCurrentHandForTest(created.roomCode);
     game.adjustChipsForTest(created.roomCode, aiSeat.occupant.id, 2400);
 
     const joined = game.joinRoom({
       roomCode: created.roomCode,
       nickname: "朋友",
     });
-    assert.equal(joined.snapshot.pendingReplacement, true);
+    assert.equal(joined.snapshot.pendingReplacement, undefined);
+    const friendSeat = joined.snapshot.seats.find((seat) => seat.occupant?.id === joined.playerId);
+    assert.equal((friendSeat?.occupant?.chips ?? 0) + (friendSeat?.roundBet ?? 0), 2400);
+  });
+
+  it("does not issue a fresh starting stack when a player leaves and later reclaims a Seat", () => {
+    const game = new GameService({ roomCodeGenerator: () => "STACK01", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const first = game.joinRoom({ roomCode: created.roomCode, nickname: "第一位玩家" });
+    game.finishCurrentHandForTest(created.roomCode);
+    game.adjustChipsForTest(created.roomCode, first.playerId, 1);
+    game.leaveSeat(created.roomCode, first.playerId);
+
+    assert.throws(() => game.joinRoom({ roomCode: created.roomCode, nickname: "替补玩家" }), /AI 接管席位已为原玩家保留/);
+
+    const reclaimed = game.reclaimSeat(created.roomCode, first.sessionId);
+    const replacementSeat = reclaimed.snapshot.seats.find((seat) => seat.occupant?.id === reclaimed.playerId);
+
+    assert.equal(replacementSeat?.occupant?.chips, 1);
+  });
+
+  it("reserves an AI Takeover Seat for the original Temporary Player Identity", () => {
+    const game = new GameService({ roomCodeGenerator: () => "TAKE01", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "原玩家" });
+    game.finishCurrentHandForTest(created.roomCode);
+    game.adjustChipsForTest(created.roomCode, joined.playerId, 123);
+    game.leaveSeat(created.roomCode, joined.playerId);
+
+    assert.throws(() => game.joinRoom({ roomCode: created.roomCode, nickname: "其他玩家" }), /AI 接管席位已为原玩家保留/);
+
+    const reclaimed = game.reclaimSeat(created.roomCode, joined.sessionId);
+    const reclaimedSeat = reclaimed.snapshot.seats.find((seat) => seat.occupant?.id === reclaimed.playerId);
+    assert.equal(reclaimedSeat?.occupant?.chips, 123);
+  });
+
+  it("allows a Temporary Player Identity to occupy or reserve only one Seat", () => {
+    const game = new GameService({ roomCodeGenerator: () => "SESS01", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 3,
+      requiredHumanCount: 3,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    game.joinRoom({ roomCode: created.roomCode, nickname: "第一位玩家", sessionId: "shared-session" });
+
+    assert.throws(
+      () => game.joinRoom({ roomCode: created.roomCode, nickname: "第二位玩家", sessionId: "shared-session" }),
+      /该临时身份已在房间中/,
+    );
+
+    const pendingGame = new GameService({ roomCodeGenerator: () => "SESS02", idGenerator: sequentialIds() });
+    const pendingRoom = pendingGame.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    pendingGame.joinRoom({ roomCode: pendingRoom.roomCode, nickname: "候补玩家", sessionId: "reserved-session" });
+    assert.throws(
+      () => pendingGame.joinRoom({ roomCode: pendingRoom.roomCode, nickname: "重复候补", sessionId: "reserved-session" }),
+      /该临时身份已在房间中/,
+    );
+  });
+
+  it("uses the only Rebuy allocation when refilling a previously occupied empty Seat", () => {
+    const game = new GameService({ roomCodeGenerator: () => "STACK02", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const first = game.joinRoom({ roomCode: created.roomCode, nickname: "第一位玩家" });
+    game.finishCurrentHandForTest(created.roomCode);
+    game.adjustChipsForTest(created.roomCode, first.playerId, 0);
+    game.leaveSeat(created.roomCode, first.playerId);
+
+    const second = game.joinRoom({ roomCode: created.roomCode, nickname: "第二位玩家" });
+    const secondSeat = second.snapshot.seats.find((seat) => seat.occupant?.id === second.playerId);
+    assert.equal(secondSeat?.occupant?.rebuyCount, 1);
+    assert.equal((secondSeat?.occupant?.chips ?? 0) + (secondSeat?.roundBet ?? 0), 500);
 
     game.finishCurrentHandForTest(created.roomCode);
-    const afterHand = game.snapshot(created.roomCode, joined.playerId);
-    const friendSeat = afterHand.seats.find((seat) => seat.occupant?.id === joined.playerId);
-    assert.equal(friendSeat?.occupant?.chips, 1000);
+    game.adjustChipsForTest(created.roomCode, second.playerId, 0);
+    game.leaveSeat(created.roomCode, second.playerId);
+    assert.throws(() => game.joinRoom({ roomCode: created.roomCode, nickname: "第三位玩家" }), /没有可用筹码额度/);
   });
 
   it("hides other players' Hole Cards before Showdown", () => {
@@ -189,6 +348,93 @@ describe("Private Room lifecycle", () => {
     assert.equal(afterRejectedRaise.seats.find((seat) => seat.occupant?.id === created.playerId)?.roundBet, 5);
   });
 
+  it("does not reopen betting after a short All-In raise", () => {
+    const game = new GameService({ roomCodeGenerator: () => "SHORT2", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "先行动玩家",
+      seatCount: 3,
+      requiredHumanCount: 3,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const caller = game.joinRoom({ roomCode: created.roomCode, nickname: "跟注玩家" });
+    const shortStack = game.joinRoom({ roomCode: created.roomCode, nickname: "短码玩家" });
+
+    game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "raise", amount: 100 });
+    game.applyAction({ roomCode: created.roomCode, playerId: caller.playerId, action: "call" });
+    game.adjustChipsForTest(created.roomCode, shortStack.playerId, 140);
+    game.applyAction({ roomCode: created.roomCode, playerId: shortStack.playerId, action: "raise", amount: 150 });
+
+    const afterShortAllIn = game.snapshot(created.roomCode, created.playerId);
+    assert.deepEqual(afterShortAllIn.legalActions.map((action) => action.type), ["fold", "call"]);
+    assert.equal(afterShortAllIn.legalActions.find((action) => action.type === "call")?.callAmount, 50);
+    assert.throws(
+      () => game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "raise", amount: 240 }),
+      /加注权尚未重新开放/,
+    );
+  });
+
+  it("does not overbook pending AI Replacements during a Hand", () => {
+    const game = new GameService({ roomCodeGenerator: () => "QUEUE1", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 1000,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+
+    const firstReplacement = game.joinRoom({ roomCode: created.roomCode, nickname: "第一位朋友" });
+    assert.equal(firstReplacement.snapshot.pendingReplacement, true);
+    assert.throws(() => game.joinRoom({ roomCode: created.roomCode, nickname: "第二位朋友" }), /已被预定/);
+  });
+
+  it("cancels a pending AI Replacement when the waiting player disconnects", () => {
+    const game = new GameService({ roomCodeGenerator: () => "QUEUE2", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const pending = game.joinRoom({ roomCode: created.roomCode, nickname: "候补玩家" });
+
+    game.markDisconnected(created.roomCode, pending.playerId);
+    game.finishCurrentHandForTest(created.roomCode);
+
+    assert.equal(game.snapshot(created.roomCode).seats.some((seat) => seat.occupant?.id === pending.playerId), false);
+  });
+
+  it("keeps an all-in player's Seat in the current Hand after leaving", () => {
+    const game = new GameService({ roomCodeGenerator: () => "LEAVE1", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "全下玩家",
+      seatCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+
+    game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "all-in" });
+    const afterLeaving = game.leaveSeat(created.roomCode, created.playerId);
+    const takeoverSeat = afterLeaving.seats.find((seat) => seat.occupant?.nickname.includes("全下玩家"));
+
+    assert.equal(afterLeaving.hand?.phase, "preflop");
+    assert.equal(takeoverSeat?.occupant?.kind, "ai");
+    assert.equal(takeoverSeat?.occupant?.chips, 0);
+    assert.equal(takeoverSeat?.occupant?.takeover, true);
+  });
+
   it("converts Host Removal into an AI Takeover Seat that inherits chips", () => {
     const game = new GameService({ roomCodeGenerator: () => "ROOM04", idGenerator: sequentialIds() });
     const created = game.createRoom({
@@ -201,6 +447,13 @@ describe("Private Room lifecycle", () => {
       bigBlind: 10,
     });
     const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    assert.throws(
+      () => game.removePlayer(created.roomCode, created.playerId, joined.playerId),
+      /当前手牌结算后移除玩家/,
+    );
+
+    game.finishCurrentHandForTest(created.roomCode);
     game.adjustChipsForTest(created.roomCode, joined.playerId, 1777);
 
     const snapshot = game.removePlayer(created.roomCode, created.playerId, joined.playerId);
@@ -209,6 +462,31 @@ describe("Private Room lifecycle", () => {
     assert.equal(takeoverSeat?.occupant?.kind, "ai");
     assert.equal(takeoverSeat?.occupant?.chips, 1777);
     assert.equal(takeoverSeat?.occupant?.takeover, true);
+  });
+
+  it("releases a zero-chip Seat removed by the Host for a valid replacement", () => {
+    const game = new GameService({ roomCodeGenerator: () => "ROOM04Z", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "筹码归零玩家" });
+    game.finishCurrentHandForTest(created.roomCode);
+    game.adjustChipsForTest(created.roomCode, joined.playerId, 0);
+
+    const removed = game.removePlayer(created.roomCode, created.playerId, joined.playerId);
+    assert.equal(removed.seats.some((seat) => seat.occupant?.id === joined.playerId), false);
+
+    const replacement = game.joinRoom({ roomCode: created.roomCode, nickname: "替补玩家" });
+    const replacementSeat = replacement.snapshot.seats.find((seat) => seat.occupant?.id === replacement.playerId);
+    assert.equal(replacementSeat?.occupant?.rebuyCount, 1);
+    assert.equal((replacementSeat?.occupant?.chips ?? 0) + (replacementSeat?.roundBet ?? 0), 500);
   });
 
   it("allows the same Temporary Player Identity to reclaim an AI Takeover Seat", () => {
@@ -277,6 +555,26 @@ describe("Private Room lifecycle", () => {
     assert.equal(friendView.tableLog.some((line) => line.includes("朋友 成为新房主")), true);
   });
 
+  it("restores Host controls when the last Host reclaims an AI Takeover Seat", () => {
+    const game = new GameService({ roomCodeGenerator: () => "HOST03", idGenerator: sequentialIds() });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      aiCount: 1,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+
+    game.leaveSeat(created.roomCode, created.playerId);
+    const reclaimed = game.reclaimSeat(created.roomCode, created.sessionId);
+    const paused = game.setPaused(created.roomCode, reclaimed.playerId, true);
+
+    assert.equal(paused.hostPlayerId, reclaimed.playerId);
+    assert.equal(paused.paused, true);
+  });
+
   it("lets only the Host pause and resume active gameplay", () => {
     const game = new GameService({ roomCodeGenerator: () => "PAUSE1", idGenerator: sequentialIds() });
     const created = game.createRoom({
@@ -335,13 +633,15 @@ describe("Private Room lifecycle", () => {
       requiredHumanCount: 2,
       aiCount: 0,
       aiDifficulty: "standard",
-      initialChips: 10,
+      initialChips: 500,
       smallBlind: 5,
       bigBlind: 10,
     });
     const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
 
-    const settled = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "call" });
+    game.adjustChipsForTest(created.roomCode, joined.playerId, 10);
+    game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "all-in" });
+    const settled = game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "all-in" });
     assert.equal(settled.hand?.phase, "settled");
     assert.equal(settled.seats.find((seat) => seat.occupant?.id === joined.playerId)?.occupant?.waitingForRebuy, true);
 
@@ -354,6 +654,82 @@ describe("Private Room lifecycle", () => {
     const next = game.startNextHand(created.roomCode, created.playerId);
     assert.equal(next.hand?.phase, "preflop");
     assert.notEqual(next.hand?.id, settled.hand?.id);
+  });
+
+  it("allows one Rebuy, then eliminates a player who busts again", () => {
+    const game = new GameService({ roomCodeGenerator: () => "REBUY2", idGenerator: sequentialIds(), random: () => 0.29 });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    game.adjustChipsForTest(created.roomCode, joined.playerId, 10);
+    game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "all-in" });
+    game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "all-in" });
+    const afterRebuy = game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "rebuy" });
+    const firstRebuy = afterRebuy.seats.find((seat) => seat.occupant?.id === joined.playerId)?.occupant;
+    assert.equal(firstRebuy?.rebuyCount, 1);
+    assert.equal(firstRebuy?.waitingForRebuy, false);
+
+    game.adjustChipsForTest(created.roomCode, joined.playerId, 5);
+    game.startNextHand(created.roomCode, created.playerId);
+    const settledAgain = game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "check" });
+    const eliminated = settledAgain.seats.find((seat) => seat.occupant?.id === joined.playerId)?.occupant;
+
+    assert.equal(settledAgain.hand?.phase, "settled");
+    assert.equal(eliminated?.chips, 0);
+    assert.equal(eliminated?.rebuyCount, 1);
+    assert.equal(eliminated?.waitingForRebuy, false);
+    assert.equal(eliminated?.eliminated, true);
+    assert.throws(
+      () => game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "rebuy" }),
+      /续筹次数已用完/,
+    );
+  });
+
+  it("keeps a Seat's Rebuy limit after its occupant leaves and reclaims the Seat", () => {
+    const game = new GameService({ roomCodeGenerator: () => "REBUY3", idGenerator: sequentialIds(), random: () => 0.29 });
+    const created = game.createRoom({
+      hostNickname: "房主",
+      seatCount: 2,
+      requiredHumanCount: 2,
+      aiCount: 0,
+      aiDifficulty: "standard",
+      initialChips: 500,
+      smallBlind: 5,
+      bigBlind: 10,
+    });
+    const joined = game.joinRoom({ roomCode: created.roomCode, nickname: "朋友" });
+
+    game.adjustChipsForTest(created.roomCode, joined.playerId, 10);
+    game.applyAction({ roomCode: created.roomCode, playerId: created.playerId, action: "all-in" });
+    game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "all-in" });
+    game.applyAction({ roomCode: created.roomCode, playerId: joined.playerId, action: "rebuy" });
+    game.leaveSeat(created.roomCode, joined.playerId);
+
+    assert.throws(() => game.joinRoom({ roomCode: created.roomCode, nickname: "替补玩家" }), /AI 接管席位已为原玩家保留/);
+
+    const replacement = game.reclaimSeat(created.roomCode, joined.sessionId);
+    const replacementSeat = replacement.snapshot.seats.find((seat) => seat.occupant?.id === replacement.playerId);
+    assert.equal(replacementSeat?.occupant?.rebuyCount, 1);
+
+    game.startNextHand(created.roomCode, created.playerId);
+    game.adjustChipsForTest(created.roomCode, replacement.playerId, 0);
+    game.applyAction({ roomCode: created.roomCode, playerId: replacement.playerId, action: "fold" });
+    const eliminated = game.snapshot(created.roomCode, replacement.playerId).seats.find((seat) => seat.occupant?.id === replacement.playerId)?.occupant;
+
+    assert.equal(eliminated?.eliminated, true);
+    assert.throws(
+      () => game.applyAction({ roomCode: created.roomCode, playerId: replacement.playerId, action: "rebuy" }),
+      /续筹次数已用完/,
+    );
   });
 
   it("does not award the Pot twice if settlement is triggered again", () => {

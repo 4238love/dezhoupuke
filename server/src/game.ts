@@ -5,6 +5,10 @@ export type PlayerKind = "human" | "ai";
 export type HandPhase = "preflop" | "flop" | "turn" | "river" | "settled";
 export type PlayerActionType = "fold" | "check" | "call" | "bet" | "raise" | "all-in" | "rebuy";
 
+const MAX_REBUYS_PER_SEAT = 1;
+const MIN_INITIAL_CHIPS_IN_BIG_BLINDS = 50;
+const MAX_INITIAL_CHIPS_IN_BIG_BLINDS = 200;
+
 export interface CreateRoomInput {
   hostNickname: string;
   seatCount: number;
@@ -66,12 +70,16 @@ export interface Occupant {
   connected: boolean;
   sessionId?: string;
   disconnectedAt?: number;
+  rebuyCount: number;
   waitingForRebuy?: boolean;
+  eliminated?: boolean;
   takeoverForSessionId?: string;
 }
 
 export interface Seat {
   index: number;
+  initialStackIssued: boolean;
+  rebuyCount: number;
   occupant?: Occupant;
 }
 
@@ -84,6 +92,7 @@ interface HandParticipant {
   folded: boolean;
   allIn: boolean;
   acted: boolean;
+  raiseAllowed: boolean;
 }
 
 interface HandState {
@@ -133,7 +142,9 @@ export interface PublicSeat {
     nickname: string;
     chips: number;
     connected: boolean;
+    rebuyCount: number;
     waitingForRebuy?: boolean;
+    eliminated?: boolean;
     takeover: boolean;
   };
   holeCards?: Card[];
@@ -154,6 +165,7 @@ export interface RoomSnapshot {
     initialChips: number;
     smallBlind: number;
     bigBlind: number;
+    maxRebuys: number;
   };
   seats: PublicSeat[];
   hand?: {
@@ -196,7 +208,11 @@ export class GameService {
     const code = this.uniqueRoomCode();
     const hostId = this.idGenerator();
     const sessionId = this.idGenerator();
-    const seats: Seat[] = Array.from({ length: input.seatCount }, (_, index) => ({ index }));
+    const seats: Seat[] = Array.from({ length: input.seatCount }, (_, index) => ({
+      index,
+      initialStackIssued: false,
+      rebuyCount: 0,
+    }));
     seats[0].occupant = {
       id: hostId,
       kind: "human",
@@ -204,10 +220,13 @@ export class GameService {
       chips: input.initialChips,
       connected: true,
       sessionId,
+      rebuyCount: seats[0].rebuyCount,
     };
+    seats[0].initialStackIssued = true;
 
     for (let index = 0; index < input.aiCount; index += 1) {
       seats[index + 1].occupant = this.createAi(index + 1, input.initialChips);
+      seats[index + 1].initialStackIssued = true;
     }
 
     const room: Room = {
@@ -245,42 +264,64 @@ export class GameService {
       throw new Error("房间内昵称不能重复");
     }
 
-    const playerId = this.idGenerator();
     const sessionId = input.sessionId ?? this.idGenerator();
-    const emptySeat = room.seats.find((seat) => !seat.occupant);
+    const sessionAlreadyInRoom =
+      room.seats.some(
+        (seat) =>
+          seat.occupant?.sessionId === sessionId ||
+          seat.occupant?.takeoverForSessionId === sessionId,
+      ) || room.pendingReplacements.some((replacement) => replacement.sessionId === sessionId);
+    if (sessionAlreadyInRoom) {
+      throw new Error("该临时身份已在房间中，请使用重连");
+    }
+    const playerId = this.idGenerator();
+    const emptySeat = room.seats.find((seat) => !seat.occupant && this.canIssueStackToEmptySeat(seat));
     if (emptySeat) {
-      emptySeat.occupant = {
-        id: playerId,
-        kind: "human",
-        nickname,
-        chips: room.initialChips,
-        connected: true,
-        sessionId,
-      };
-      room.tableLog.push(`${nickname} 加入了房间`);
+      this.assignHumanToEmptySeat(room, emptySeat, { playerId, nickname, sessionId });
       this.startHandIfReady(room);
       return { roomCode: room.code, playerId, sessionId, snapshot: this.snapshot(room.code, playerId) };
     }
 
-    const aiSeat = room.seats.find((seat) => seat.occupant?.kind === "ai");
+    const aiSeat = room.seats.find(
+      (seat) => seat.occupant?.kind === "ai" && !seat.occupant.takeoverForSessionId,
+    );
     if (!aiSeat) {
+      if (room.seats.some((seat) => !seat.occupant)) {
+        throw new Error("没有可用筹码额度的空位");
+      }
+      if (room.seats.some((seat) => seat.occupant?.takeoverForSessionId)) {
+        throw new Error("AI 接管席位已为原玩家保留");
+      }
       throw new Error("房间已满");
     }
 
     if (!room.hand || room.hand.phase === "settled") {
+      const aiOccupant = aiSeat.occupant;
+      if (!aiOccupant) {
+        throw new Error("AI 席位不存在");
+      }
+      const chips = aiOccupant.chips;
       aiSeat.occupant = {
         id: playerId,
         kind: "human",
         nickname,
-        chips: room.initialChips,
+        chips,
         connected: true,
         sessionId,
+        rebuyCount: aiSeat.rebuyCount,
       };
-      room.tableLog.push(`${nickname} 替换了 AI，对下一手生效`);
+      this.ensureHumanHost(room, aiSeat.occupant);
+      room.tableLog.push(`${nickname} 接管了 AI 席位并继承 ${chips} 筹码`);
       this.startHandIfReady(room);
       return { roomCode: room.code, playerId, sessionId, snapshot: this.snapshot(room.code, playerId) };
     }
 
+    const replaceableAiCount = room.seats.filter(
+      (seat) => seat.occupant?.kind === "ai" && !seat.occupant.takeoverForSessionId,
+    ).length;
+    if (room.pendingReplacements.length >= replaceableAiCount) {
+      throw new Error("可替换的 AI 席位已被预定");
+    }
     room.pendingReplacements.push({ playerId, nickname, sessionId });
     room.tableLog.push(`${nickname} 将在本手结束后替换 AI`);
     return { roomCode: room.code, playerId, sessionId, snapshot: { ...this.snapshot(room.code, playerId), pendingReplacement: true } };
@@ -304,7 +345,9 @@ export class GameService {
               nickname: seat.occupant.nickname,
               chips: seat.occupant.chips,
               connected: seat.occupant.connected,
+              rebuyCount: seat.occupant.rebuyCount,
               waitingForRebuy: seat.occupant.waitingForRebuy,
+              eliminated: seat.occupant.eliminated,
               takeover: Boolean(seat.occupant.takeoverForSessionId),
             }
           : undefined,
@@ -327,6 +370,7 @@ export class GameService {
         initialChips: room.initialChips,
         smallBlind: room.smallBlind,
         bigBlind: room.bigBlind,
+        maxRebuys: MAX_REBUYS_PER_SEAT,
       },
       seats: publicSeats,
       hand: hand
@@ -359,13 +403,22 @@ export class GameService {
   applyAction(input: PlayerActionInput): RoomSnapshot {
     const room = this.requireRoom(input.roomCode);
     if (input.action === "rebuy") {
-      const occupant = this.findOccupant(room, input.playerId);
-      if (!occupant || !occupant.waitingForRebuy) {
+      const seat = this.findSeat(room, input.playerId);
+      const occupant = seat?.occupant;
+      if (!seat || !occupant) {
+        throw new Error("当前不能重新买入");
+      }
+      if (seat.rebuyCount >= MAX_REBUYS_PER_SEAT) {
+        throw new Error("本局续筹次数已用完");
+      }
+      if (!occupant.waitingForRebuy) {
         throw new Error("当前不能重新买入");
       }
       occupant.chips = room.initialChips;
+      seat.rebuyCount += 1;
+      occupant.rebuyCount = seat.rebuyCount;
       occupant.waitingForRebuy = false;
-      room.tableLog.push(`${occupant.nickname} 重新买入 ${room.initialChips}`);
+      room.tableLog.push(`${occupant.nickname} 续筹 ${room.initialChips}（${occupant.rebuyCount}/${MAX_REBUYS_PER_SEAT}）`);
       if (!room.hand || room.hand.phase !== "settled") {
         this.startHandIfReady(room);
       }
@@ -493,13 +546,36 @@ export class GameService {
 
   leaveSeat(roomCode: string, playerId: string): RoomSnapshot {
     const room = this.requireRoom(roomCode);
-    this.convertHumanToAiTakeover(room, playerId, "离开");
+    const pendingIndex = room.pendingReplacements.findIndex((replacement) => replacement.playerId === playerId);
+    if (pendingIndex >= 0) {
+      const [replacement] = room.pendingReplacements.splice(pendingIndex, 1);
+      room.tableLog.push(`${replacement.nickname} 取消了替补 AI`);
+      return this.snapshot(roomCode, playerId);
+    }
+    const seat = room.seats.find((item) => item.occupant?.id === playerId && item.occupant.kind === "human");
+    if (!seat?.occupant) {
+      throw new Error("玩家不在房间中");
+    }
+    if (seat.occupant.chips <= 0 && (!room.hand || room.hand.phase === "settled")) {
+      const nickname = seat.occupant.nickname;
+      seat.occupant = undefined;
+      this.transferHostIfNeeded(room, playerId);
+      room.tableLog.push(`${nickname} 离开了牌桌`);
+    } else {
+      this.convertHumanToAiTakeover(room, playerId, "离开");
+    }
     this.updateHumanAbsence(room);
     return this.snapshot(roomCode, playerId);
   }
 
   markDisconnected(roomCode: string, playerId: string): void {
     const room = this.requireRoom(roomCode);
+    const pendingIndex = room.pendingReplacements.findIndex((replacement) => replacement.playerId === playerId);
+    if (pendingIndex >= 0) {
+      const [replacement] = room.pendingReplacements.splice(pendingIndex, 1);
+      room.tableLog.push(`${replacement.nickname} 断线，取消替补 AI`);
+      return;
+    }
     const occupant = this.findOccupant(room, playerId);
     if (!occupant || occupant.kind !== "human") {
       return;
@@ -520,6 +596,7 @@ export class GameService {
     if (seat?.occupant && seat.occupant.kind === "human") {
       seat.occupant.connected = true;
       seat.occupant.disconnectedAt = undefined;
+      this.ensureHumanHost(room, seat.occupant);
       room.tableLog.push(`${seat.occupant.nickname} 已重连`);
       this.updateHumanAbsence(room);
       return { playerId: seat.occupant.id, snapshot: this.snapshot(roomCode, seat.occupant.id) };
@@ -556,6 +633,21 @@ export class GameService {
     if (room.hostPlayerId !== hostPlayerId) {
       throw new Error("只有房主可以移除玩家");
     }
+    if (room.hand && room.hand.phase !== "settled") {
+      throw new Error("只能在当前手牌结算后移除玩家");
+    }
+    const targetSeat = this.findSeat(room, targetPlayerId);
+    if (!targetSeat?.occupant || targetSeat.occupant.kind !== "human") {
+      throw new Error("玩家不在房间中");
+    }
+    if (targetSeat.occupant.chips <= 0) {
+      const nickname = targetSeat.occupant.nickname;
+      targetSeat.occupant = undefined;
+      this.transferHostIfNeeded(room, targetPlayerId);
+      room.tableLog.push(`被房主移除：${nickname} 的零筹码席位已释放`);
+      this.updateHumanAbsence(room);
+      return this.snapshot(roomCode, hostPlayerId);
+    }
     this.convertHumanToAiTakeover(room, targetPlayerId, "被房主移除");
     this.updateHumanAbsence(room);
     return this.snapshot(roomCode, hostPlayerId);
@@ -575,6 +667,7 @@ export class GameService {
     if (!seat?.occupant) {
       throw new Error("没有可恢复的席位");
     }
+    const previousPlayerId = seat.occupant.id;
     seat.occupant = {
       id: this.idGenerator(),
       kind: "human",
@@ -582,7 +675,13 @@ export class GameService {
       chips: seat.occupant.chips,
       connected: true,
       sessionId,
+      rebuyCount: seat.occupant.rebuyCount,
     };
+    this.ensureHumanHost(room, seat.occupant);
+    const participant = room.hand?.participants.find((item) => item.playerId === previousPlayerId);
+    if (participant) {
+      participant.playerId = seat.occupant.id;
+    }
     room.tableLog.push(`${seat.occupant.nickname} 重新接管了席位`);
     return { playerId: seat.occupant.id, snapshot: this.snapshot(roomCode, seat.occupant.id) };
   }
@@ -642,6 +741,7 @@ export class GameService {
         folded: false,
         allIn: false,
         acted: false,
+        raiseAllowed: true,
       });
     }
 
@@ -677,6 +777,9 @@ export class GameService {
     }
     const toCall = Math.max(0, hand.currentBet - participant.roundBet);
     if (toCall === 0) {
+      if (!participant.raiseAllowed) {
+        return [{ type: "check" }];
+      }
       return [
         { type: "check" },
         { type: "bet", minAmount: Math.min(room.bigBlind, occupant.chips) },
@@ -685,12 +788,13 @@ export class GameService {
     }
     const minRaiseTo = hand.currentBet + hand.minRaise;
     const maximum = participant.roundBet + occupant.chips;
-    const raiseAction = maximum >= minRaiseTo ? [{ type: "raise" as const, minAmount: minRaiseTo }] : [];
+    const raiseAction = participant.raiseAllowed && maximum >= minRaiseTo ? [{ type: "raise" as const, minAmount: minRaiseTo }] : [];
+    const allInAction = participant.raiseAllowed || occupant.chips <= toCall ? [{ type: "all-in" as const }] : [];
     return [
       { type: "fold" },
       { type: "call", callAmount: Math.min(toCall, occupant.chips) },
       ...raiseAction,
-      { type: "all-in" },
+      ...allInAction,
     ];
   }
 
@@ -710,6 +814,7 @@ export class GameService {
     if (action === "fold") {
       participant.folded = true;
       participant.acted = true;
+      participant.raiseAllowed = false;
       room.tableLog.push(`${occupant.nickname} 弃牌`);
       return;
     }
@@ -719,6 +824,7 @@ export class GameService {
         throw new Error("当前不能过牌");
       }
       participant.acted = true;
+      participant.raiseAllowed = false;
       room.tableLog.push(`${occupant.nickname} 过牌`);
       return;
     }
@@ -729,11 +835,15 @@ export class GameService {
       }
       const paid = payChips(occupant, participant, toCall);
       participant.acted = true;
+      participant.raiseAllowed = false;
       room.tableLog.push(`${occupant.nickname} 跟注 ${paid}`);
       return;
     }
 
     if (action === "bet") {
+      if (!participant.raiseAllowed) {
+        throw new Error("加注权尚未重新开放");
+      }
       if (toCall > 0) {
         throw new Error("当前不能下注，只能加注或跟注");
       }
@@ -746,11 +856,15 @@ export class GameService {
       hand.minRaise = paid;
       markOthersUnacted(hand, participant);
       participant.acted = true;
+      participant.raiseAllowed = false;
       room.tableLog.push(`${occupant.nickname} 下注 ${paid}`);
       return;
     }
 
     if (action === "raise") {
+      if (!participant.raiseAllowed) {
+        throw new Error("加注权尚未重新开放");
+      }
       const raiseTo = requireAmount(amount, "加注金额不能为空");
       if (raiseTo <= hand.currentBet) {
         throw new Error("加注后金额必须高于当前下注");
@@ -764,18 +878,24 @@ export class GameService {
         throw new Error("加注金额小于最小加注");
       }
       payChips(occupant, participant, payAmount);
-      if (raiseSize >= hand.minRaise) {
+      const isFullRaise = raiseSize >= hand.minRaise;
+      if (isFullRaise) {
         hand.minRaise = raiseSize;
+        markOthersUnacted(hand, participant);
       }
       hand.currentBet = participant.roundBet;
-      markOthersUnacted(hand, participant);
       participant.acted = true;
+      participant.raiseAllowed = false;
       room.tableLog.push(`${occupant.nickname} 加注到 ${participant.roundBet}`);
       return;
     }
 
     if (action === "all-in") {
       const before = participant.roundBet;
+      const willRaise = participant.roundBet + occupant.chips > hand.currentBet;
+      if (willRaise && !participant.raiseAllowed) {
+        throw new Error("加注权尚未重新开放");
+      }
       const paid = payChips(occupant, participant, occupant.chips);
       if (participant.roundBet > hand.currentBet) {
         const raiseSize = participant.roundBet - hand.currentBet;
@@ -786,6 +906,7 @@ export class GameService {
         hand.currentBet = participant.roundBet;
       }
       participant.acted = true;
+      participant.raiseAllowed = false;
       room.tableLog.push(`${occupant.nickname} 全下 ${paid}，本轮从 ${before} 到 ${participant.roundBet}`);
       return;
     }
@@ -827,6 +948,7 @@ export class GameService {
     for (const participant of hand.participants) {
       participant.roundBet = 0;
       participant.acted = false;
+      participant.raiseAllowed = true;
     }
     hand.currentBet = 0;
     hand.minRaise = room.bigBlind;
@@ -870,11 +992,13 @@ export class GameService {
       hand.awards = settlePots(
         hand.participants.map((participant) => ({
           playerId: participant.playerId,
+          seatIndex: participant.seatIndex,
           contribution: participant.contribution,
           folded: participant.folded,
           cards: participant.holeCards,
         })),
         hand.communityCards,
+        hand.dealerSeatIndex,
       );
     }
 
@@ -890,13 +1014,28 @@ export class GameService {
       if (!seat.occupant) {
         continue;
       }
-      if (seat.occupant.kind === "ai" && seat.occupant.chips <= 0) {
-        seat.occupant.chips = room.initialChips;
-        room.tableLog.push(`${seat.occupant.nickname} 自动重新买入`);
+      if (seat.occupant.chips > 0) {
+        continue;
       }
-      if (seat.occupant.kind === "human" && seat.occupant.chips <= 0) {
+      if (seat.occupant.kind === "ai") {
+        if (seat.rebuyCount < MAX_REBUYS_PER_SEAT) {
+          seat.occupant.chips = room.initialChips;
+          seat.rebuyCount += 1;
+          seat.occupant.rebuyCount = seat.rebuyCount;
+          room.tableLog.push(`${seat.occupant.nickname} 自动续筹 ${room.initialChips}（${seat.occupant.rebuyCount}/${MAX_REBUYS_PER_SEAT}）`);
+        } else {
+          room.tableLog.push(`${seat.occupant.nickname} 续筹次数已用完，离开牌桌`);
+          seat.occupant = undefined;
+        }
+        continue;
+      }
+      if (seat.rebuyCount < MAX_REBUYS_PER_SEAT) {
         seat.occupant.waitingForRebuy = true;
-        room.tableLog.push(`${seat.occupant.nickname} 筹码为 0，等待重新买入`);
+        room.tableLog.push(`${seat.occupant.nickname} 筹码为 0，可续筹一次`);
+      } else {
+        seat.occupant.waitingForRebuy = false;
+        seat.occupant.eliminated = true;
+        room.tableLog.push(`${seat.occupant.nickname} 续筹次数已用完，请离开牌桌`);
       }
     }
 
@@ -917,26 +1056,70 @@ export class GameService {
       nickname: `AI接管-${seat.occupant.nickname}`,
       chips: seat.occupant.chips,
       connected: true,
+      rebuyCount: seat.occupant.rebuyCount,
       takeoverForSessionId: sessionId,
     };
     const participant = room.hand?.participants.find((item) => item.playerId === playerId);
     if (participant) {
       participant.playerId = seat.occupant.id;
     }
-    this.transferHostIfNeeded(room, playerId);
+    this.transferHostIfNeeded(room, playerId, seat.occupant.id);
     room.tableLog.push(`${reason}：席位由 AI 接管并继承筹码`);
   }
 
-  private transferHostIfNeeded(room: Room, leavingPlayerId: string): void {
+  private transferHostIfNeeded(room: Room, leavingPlayerId: string, retainedHostId?: string): void {
     if (room.hostPlayerId !== leavingPlayerId) {
       return;
     }
     const nextHost = room.seats.find((seat) => seat.occupant?.kind === "human" && seat.occupant.connected)?.occupant;
     if (!nextHost) {
+      if (retainedHostId) {
+        room.hostPlayerId = retainedHostId;
+      }
       return;
     }
     room.hostPlayerId = nextHost.id;
     room.tableLog.push(`${nextHost.nickname} 成为新房主`);
+  }
+
+  private ensureHumanHost(room: Room, occupant: Occupant): void {
+    const currentHost = this.findOccupant(room, room.hostPlayerId);
+    if (currentHost?.kind === "human") {
+      return;
+    }
+    room.hostPlayerId = occupant.id;
+    room.tableLog.push(`${occupant.nickname} 成为新房主`);
+  }
+
+  private canIssueStackToEmptySeat(seat: Seat): boolean {
+    return !seat.initialStackIssued || seat.rebuyCount < MAX_REBUYS_PER_SEAT;
+  }
+
+  private assignHumanToEmptySeat(
+    room: Room,
+    seat: Seat,
+    replacement: Pick<PendingReplacement, "playerId" | "nickname" | "sessionId">,
+  ): void {
+    const usesRebuyAllocation = seat.initialStackIssued;
+    if (usesRebuyAllocation) {
+      seat.rebuyCount += 1;
+    }
+    seat.initialStackIssued = true;
+    seat.occupant = {
+      id: replacement.playerId,
+      kind: "human",
+      nickname: replacement.nickname,
+      chips: room.initialChips,
+      connected: true,
+      sessionId: replacement.sessionId,
+      rebuyCount: seat.rebuyCount,
+    };
+    this.ensureHumanHost(room, seat.occupant);
+    room.tableLog.push(
+      usesRebuyAllocation
+        ? `${replacement.nickname} 使用席位的剩余续筹额度入座`
+        : `${replacement.nickname} 加入了房间`,
+    );
   }
 
   private applyPendingReplacements(room: Room): void {
@@ -945,20 +1128,29 @@ export class GameService {
       if (!replacement) {
         break;
       }
-      const aiSeat = room.seats.find((seat) => seat.occupant?.kind === "ai");
-      if (!aiSeat) {
-        room.tableLog.push(`${replacement.nickname} 替换失败：房间已满`);
+      const availableSeat =
+        room.seats.find((seat) => seat.occupant?.kind === "ai" && !seat.occupant.takeoverForSessionId) ??
+        room.seats.find((seat) => !seat.occupant && this.canIssueStackToEmptySeat(seat));
+      if (!availableSeat) {
+        room.tableLog.push(`${replacement.nickname} 替补失败：没有可用筹码额度的席位`);
         continue;
       }
-      aiSeat.occupant = {
+      if (!availableSeat.occupant) {
+        this.assignHumanToEmptySeat(room, availableSeat, replacement);
+        continue;
+      }
+      const chips = availableSeat.occupant.chips;
+      availableSeat.occupant = {
         id: replacement.playerId,
         kind: "human",
         nickname: replacement.nickname,
-        chips: room.initialChips,
+        chips,
         connected: true,
         sessionId: replacement.sessionId,
+        rebuyCount: availableSeat.rebuyCount,
       };
-      room.tableLog.push(`${replacement.nickname} 替换 AI 入座`);
+      this.ensureHumanHost(room, availableSeat.occupant);
+      room.tableLog.push(`${replacement.nickname} 接管 AI 席位并继承 ${chips} 筹码`);
     }
   }
 
@@ -1005,6 +1197,7 @@ export class GameService {
       nickname: `AI-${index}`,
       chips,
       connected: true,
+      rebuyCount: 0,
     };
   }
 
@@ -1032,19 +1225,26 @@ export class GameService {
   }
 
   private findOccupant(room: Room, playerId: string): Occupant | undefined {
-    return room.seats.find((seat) => seat.occupant?.id === playerId)?.occupant;
+    return this.findSeat(room, playerId)?.occupant;
+  }
+
+  private findSeat(room: Room, playerId: string): Seat | undefined {
+    return room.seats.find((seat) => seat.occupant?.id === playerId);
   }
 }
 
 function validateCreateRoom(input: CreateRoomInput): void {
+  if (!Number.isSafeInteger(input.seatCount)) {
+    throw new Error("座位数必须是安全整数");
+  }
   if (input.seatCount < 2 || input.seatCount > 9) {
     throw new Error("座位数必须在 2 到 9 之间");
   }
   const requiredHumanCount = normalizeRequiredHumanCount(input);
-  if (!Number.isFinite(requiredHumanCount) || requiredHumanCount < 1 || requiredHumanCount > input.seatCount) {
+  if (!Number.isSafeInteger(requiredHumanCount) || requiredHumanCount < 1 || requiredHumanCount > input.seatCount) {
     throw new Error("真实玩家数量必须在 1 到座位数之间");
   }
-  if (input.aiCount < 0 || input.aiCount > input.seatCount - 1) {
+  if (!Number.isSafeInteger(input.aiCount) || input.aiCount < 0 || input.aiCount > input.seatCount - 1) {
     throw new Error("AI 数量不合法");
   }
   if (requiredHumanCount + input.aiCount > input.seatCount) {
@@ -1056,13 +1256,31 @@ function validateCreateRoom(input: CreateRoomInput): void {
   if (!input.hostNickname.trim()) {
     throw new Error("昵称不能为空");
   }
-  if (input.initialChips <= 0 || input.smallBlind <= 0 || input.bigBlind <= input.smallBlind) {
+  if (
+    !Number.isSafeInteger(input.initialChips) ||
+    !Number.isSafeInteger(input.smallBlind) ||
+    !Number.isSafeInteger(input.bigBlind) ||
+    input.initialChips <= 0 ||
+    input.smallBlind <= 0 ||
+    input.bigBlind <= input.smallBlind
+  ) {
     throw new Error("筹码或盲注设置不合法");
+  }
+  const initialChipsInBigBlinds = input.initialChips / input.bigBlind;
+  if (
+    initialChipsInBigBlinds < MIN_INITIAL_CHIPS_IN_BIG_BLINDS ||
+    initialChipsInBigBlinds > MAX_INITIAL_CHIPS_IN_BIG_BLINDS
+  ) {
+    throw new Error(`初始筹码必须在 ${MIN_INITIAL_CHIPS_IN_BIG_BLINDS} 到 ${MAX_INITIAL_CHIPS_IN_BIG_BLINDS} 个大盲之间`);
+  }
+  const maximumTableChips = input.initialChips * input.seatCount * (MAX_REBUYS_PER_SEAT + 1);
+  if (!Number.isSafeInteger(maximumTableChips)) {
+    throw new Error("初始筹码和座位数的组合超出安全结算范围");
   }
 }
 
 function normalizeRequiredHumanCount(input: CreateRoomInput): number {
-  return Math.floor(input.requiredHumanCount ?? 1);
+  return input.requiredHumanCount ?? 1;
 }
 
 function waitingRebuyHumans(room: Room): string[] {
@@ -1096,6 +1314,7 @@ function markOthersUnacted(hand: HandState, actor: HandParticipant): void {
   for (const participant of hand.participants) {
     if (participant !== actor && !participant.folded && !participant.allIn) {
       participant.acted = false;
+      participant.raiseAllowed = true;
     }
   }
 }

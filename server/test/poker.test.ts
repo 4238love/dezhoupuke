@@ -46,30 +46,69 @@ describe("Texas Hold'em hand evaluation", () => {
       [
         {
           playerId: "short",
+          seatIndex: 0,
           contribution: 50,
           folded: false,
           cards: [card("A", "S"), card("A", "H")],
         },
         {
           playerId: "middle",
+          seatIndex: 1,
           contribution: 100,
           folded: false,
           cards: [card("K", "S"), card("K", "H")],
         },
         {
           playerId: "deep",
+          seatIndex: 2,
           contribution: 200,
           folded: false,
           cards: [card("Q", "S"), card("Q", "H")],
         },
       ],
       [card("2", "C"), card("7", "D"), card("9", "S"), card("J", "C"), card("3", "H")],
+      0,
     );
 
     assert.deepEqual(awards, [
       { playerId: "short", amount: 150 },
       { playerId: "middle", amount: 100 },
       { playerId: "deep", amount: 100 },
+    ]);
+  });
+
+  it("awards an odd split-pot chip clockwise from the Dealer", () => {
+    const awards = settlePots(
+      [
+        {
+          playerId: "left-of-dealer",
+          seatIndex: 0,
+          contribution: 2,
+          folded: false,
+          cards: [card("A", "S"), card("K", "H")],
+        },
+        {
+          playerId: "right-of-dealer",
+          seatIndex: 3,
+          contribution: 2,
+          folded: false,
+          cards: [card("Q", "S"), card("J", "H")],
+        },
+        {
+          playerId: "folded",
+          seatIndex: 2,
+          contribution: 1,
+          folded: true,
+          cards: [card("2", "S"), card("3", "H")],
+        },
+      ],
+      [card("2", "C"), card("3", "D"), card("4", "H"), card("5", "S"), card("6", "C")],
+      1,
+    );
+
+    assert.deepEqual(awards, [
+      { playerId: "right-of-dealer", amount: 3 },
+      { playerId: "left-of-dealer", amount: 2 },
     ]);
   });
 });

@@ -21,7 +21,9 @@ interface PublicSeat {
     nickname: string;
     chips: number;
     connected: boolean;
+    rebuyCount: number;
     waitingForRebuy?: boolean;
+    eliminated?: boolean;
     takeover: boolean;
   };
   holeCards?: Card[];
@@ -42,6 +44,7 @@ interface RoomSnapshot {
     initialChips: number;
     smallBlind: number;
     bigBlind: number;
+    maxRebuys: number;
   };
   seats: PublicSeat[];
   hand?: {
@@ -96,6 +99,8 @@ type NumericCreateField = keyof Pick<CreateFormState, "seatCount" | "requiredHum
 
 const sessionKey = "texas-holdem-session";
 const soundKey = "texas-holdem-sound-enabled";
+const minInitialChipsInBigBlinds = 50;
+const maxInitialChipsInBigBlinds = 200;
 
 interface AudioDeviceProfile {
   webAudio: boolean;
@@ -205,10 +210,8 @@ function App() {
         setError("房间已销毁");
       }
       if (message.type === "leftRoom") {
-        localStorage.removeItem(sessionKey);
-        setSession(undefined);
         setSnapshot(undefined);
-        setError("已退出房间，原席位由 AI 接管");
+        setError("已退出房间");
       }
     });
     return () => ws.close();
@@ -310,6 +313,12 @@ function App() {
 
   function joinRoom() {
     send("joinRoom", joinForm);
+  }
+
+  function reclaimSeat() {
+    if (session) {
+      send("reconnect", session);
+    }
   }
 
   function act(type: PlayerActionType, actionAmount = amount) {
@@ -438,7 +447,8 @@ function App() {
                   <input
                     type="number"
                     inputMode="numeric"
-                    min={1}
+                    min={normalizedCreateForm.bigBlind * minInitialChipsInBigBlinds}
+                    max={normalizedCreateForm.bigBlind * maxInitialChipsInBigBlinds}
                     value={createForm.initialChips}
                     onChange={(event) => updateCreateNumber("initialChips", event.target.value)}
                     onBlur={settleCreateNumbers}
@@ -484,6 +494,11 @@ function App() {
               <button onClick={joinRoom} disabled={!connected}>
                 加入私人房间
               </button>
+              {session && (
+                <button onClick={reclaimSeat} disabled={!connected}>
+                  重新接管原席位
+                </button>
+              )}
             </section>
           </div>
         </section>
@@ -506,9 +521,11 @@ function App() {
     (seat) => seat.occupant?.kind === "human" && seat.occupant.connected && seat.occupant.waitingForRebuy,
   );
   const needsMyRebuy = Boolean(mySeat?.occupant?.waitingForRebuy);
+  const isEliminated = Boolean(me?.eliminated);
   const needsRebuyDecision = snapshot.hand?.phase === "settled" && waitingRebuySeats.length > 0;
   const rebuyNames = waitingRebuySeats.map((seat) => seat.occupant?.nickname ?? "玩家").join("、");
   const rebuyDecisionMessage = `等待 ${rebuyNames} 选择重新买入或退出后，房主才能继续下一手。`;
+  const rebuyStatus = `续筹：${me?.rebuyCount ?? 0}/${snapshot.settings.maxRebuys}`;
   const pausedMessage = isHost ? "游戏已暂停，点击“恢复游戏”继续。" : "游戏已暂停，等待房主恢复。";
   const waitingMessage =
     connectedHumanCount < requiredHumanCount
@@ -642,54 +659,56 @@ function App() {
             ))}
           </div>
 
-          {showWinnerReveal && (
-            <div className="winner-reveal" aria-live="polite">
-              <div className="winner-sparks" aria-hidden="true">
-                <span />
-                <span />
-                <span />
-                <span />
-                <span />
-                <span />
-              </div>
-              <p className="eyebrow">Showdown</p>
-              <h2>{winnerSummaries.length > 1 ? "多人分池" : "胜者揭晓"}</h2>
-              <div className="winner-list">
-                {winnerSummaries.map((winner) => (
-                  <strong key={`${winner.playerId}-${winner.amount}`}>
-                    <span className="winner-name">{winner.nickname}</span>
-                    <span className="winner-amount">+{winner.amount}</span>
-                    {winner.chips !== undefined && <small>当前筹码 {formatChips(winner.chips)}</small>}
-                  </strong>
-                ))}
-              </div>
-              {needsRebuyDecision && (
-                <div className="rebuy-decision">
-                  <strong>{rebuyDecisionMessage}</strong>
-                  {needsMyRebuy && (
-                    <button className="primary" onClick={() => act("rebuy")}>
-                      重新买入 {formatChips(snapshot.settings.initialChips)}
-                    </button>
-                  )}
-                </div>
-              )}
-              {isHost ? (
-                <div className="winner-controls">
-                  <button className="primary winner-continue" onClick={continueNextHand} disabled={needsRebuyDecision}>继续下一手</button>
-                  <button className="danger winner-continue" onClick={() => send("endRoom")}>结束对局</button>
-                </div>
-              ) : (
-                <p className="winner-host-note">{needsRebuyDecision ? "筹码为 0 的玩家请先选择重新买入或退出。" : "等待房主选择继续下一手或结束对局。"}</p>
-              )}
-            </div>
-          )}
         </div>
+
+        {showWinnerReveal && (
+          <section className="winner-reveal" aria-live="polite">
+            <div className="winner-sparks" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+              <span />
+            </div>
+            <p className="eyebrow">Showdown</p>
+            <h2>{winnerSummaries.length > 1 ? "多人分池" : "胜者揭晓"}</h2>
+            <div className="winner-list">
+              {winnerSummaries.map((winner) => (
+                <strong key={`${winner.playerId}-${winner.amount}`}>
+                  <span className="winner-name">{winner.nickname}</span>
+                  <span className="winner-amount">+{winner.amount}</span>
+                  {winner.chips !== undefined && <small>当前筹码 {formatChips(winner.chips)}</small>}
+                </strong>
+              ))}
+            </div>
+            {needsRebuyDecision && (
+              <div className="rebuy-decision">
+                <strong>{rebuyDecisionMessage}</strong>
+                {needsMyRebuy && (
+                  <button className="primary" onClick={() => act("rebuy")}>
+                    续筹 {formatChips(snapshot.settings.initialChips)}
+                  </button>
+                )}
+              </div>
+            )}
+            {isHost ? (
+              <div className="winner-controls">
+                <button className="primary winner-continue" onClick={continueNextHand} disabled={needsRebuyDecision}>继续下一手</button>
+                <button className="danger winner-continue" onClick={() => send("endRoom")}>结束对局</button>
+              </div>
+            ) : (
+              <p className="winner-host-note">{needsRebuyDecision ? "筹码为 0 的玩家请先选择重新买入或退出。" : "等待房主选择继续下一手或结束对局。"}</p>
+            )}
+          </section>
+        )}
 
         <aside className="side">
           <section className="panel status-panel">
             <p className="eyebrow">Your seat</p>
             <h2>{me?.nickname ?? "等待入座"}</h2>
             <p>筹码：{formatChips(me?.chips ?? 0)}</p>
+            <p>{rebuyStatus}</p>
             <p>盲注：{snapshot.settings.smallBlind}/{snapshot.settings.bigBlind}</p>
             <p>真实玩家：{connectedHumanCount}/{requiredHumanCount}</p>
             <p>AI 难度：{difficultyText(snapshot.settings.aiDifficulty)}</p>
@@ -700,9 +719,10 @@ function App() {
             {!isPaused && currentSeat?.occupant?.kind === "ai" && <p className="thinking">AI 思考中...</p>}
             {needsMyRebuy && (
               <button className="primary" onClick={() => act("rebuy")}>
-                重新买入 {formatChips(snapshot.settings.initialChips)}
+                续筹 {formatChips(snapshot.settings.initialChips)}
               </button>
             )}
+            {isEliminated && <p className="thinking">续筹次数已用完，请退出房间。</p>}
           </section>
 
           <section className={`panel action-panel ${canAct ? "mobile-action-visible" : ""}`}>
@@ -1055,18 +1075,23 @@ function normalizeCreateDraft(form: CreateFormState, changedField: NumericCreate
   }
 
   if (changedField === "initialChips" && form.initialChips !== "") {
-    return { ...form, initialChips: clampInteger(form.initialChips, 1, 1_000_000_000) };
+    const smallBlind = clampInteger(numberOrDefault(form.smallBlind, 5), 1, 1_000_000_000);
+    const bigBlind = clampInteger(numberOrDefault(form.bigBlind, Math.max(10, smallBlind + 1)), smallBlind + 1, 1_000_000_000);
+    return { ...form, initialChips: clampInitialChips(form.initialChips, bigBlind) };
   }
 
   if (changedField === "smallBlind" && form.smallBlind !== "") {
     const smallBlind = clampInteger(form.smallBlind, 1, 1_000_000_000);
     const bigBlind = form.bigBlind === "" ? "" : Math.max(smallBlind + 1, form.bigBlind);
-    return { ...form, smallBlind, bigBlind };
+    const initialChips = bigBlind === "" || form.initialChips === "" ? form.initialChips : clampInitialChips(form.initialChips, bigBlind);
+    return { ...form, smallBlind, bigBlind, initialChips };
   }
 
   if (changedField === "bigBlind" && form.bigBlind !== "") {
     const smallBlind = clampInteger(numberOrDefault(form.smallBlind, 5), 1, 1_000_000_000);
-    return { ...form, bigBlind: clampInteger(form.bigBlind, smallBlind + 1, 1_000_000_000) };
+    const bigBlind = clampInteger(form.bigBlind, smallBlind + 1, 1_000_000_000);
+    const initialChips = form.initialChips === "" ? "" : clampInitialChips(form.initialChips, bigBlind);
+    return { ...form, bigBlind, initialChips };
   }
 
   return form;
@@ -1076,9 +1101,9 @@ function normalizeCreateForm(form: CreateFormState): CreateRoomPayload {
   const seatCount = clampInteger(numberOrDefault(form.seatCount, 6), 2, 9);
   const requiredHumanCount = clampInteger(numberOrDefault(form.requiredHumanCount, 1), 1, seatCount);
   const aiCount = clampInteger(numberOrDefault(form.aiCount, 0), 0, seatCount - requiredHumanCount);
-  const initialChips = clampInteger(numberOrDefault(form.initialChips, 1000), 1, 1_000_000_000);
   const smallBlind = clampInteger(numberOrDefault(form.smallBlind, 5), 1, 1_000_000_000);
   const bigBlind = clampInteger(numberOrDefault(form.bigBlind, Math.max(10, smallBlind + 1)), smallBlind + 1, 1_000_000_000);
+  const initialChips = clampInitialChips(numberOrDefault(form.initialChips, bigBlind * 100), bigBlind);
 
   return {
     hostNickname: form.hostNickname,
@@ -1090,6 +1115,10 @@ function normalizeCreateForm(form: CreateFormState): CreateRoomPayload {
     smallBlind,
     bigBlind,
   };
+}
+
+function clampInitialChips(value: number, bigBlind: number): number {
+  return clampInteger(value, bigBlind * minInitialChipsInBigBlinds, bigBlind * maxInitialChipsInBigBlinds);
 }
 
 function makeWagerPresets(minimum: number | undefined, maximum: number, bigBlind: number): { label: string; value: number }[] {
