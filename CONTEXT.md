@@ -21,8 +21,8 @@ A room setting that controls how strongly all AI Opponents in a Private Room mak
 _Avoid_: AI personality, bot type
 
 **AI Replacement**:
-A join behavior where a human player takes an AI Opponent's Seat after the current Hand ends, entering with the Private Room's initial Table Chips instead of inheriting the AI Opponent's stack.
-_Avoid_: Bot takeover, chip inheritance
+A join behavior where a human player takes an unreserved AI Opponent's Seat after the current Hand ends and inherits that Seat's current Table Chips. An AI Takeover Seat remains reserved for its original Temporary Player Identity.
+_Avoid_: Bot takeover, new-chip issuance
 
 **AI Takeover Seat**:
 A Seat taken over by an AI Opponent after a human player exits a Seat, inheriting that Seat's current Table Chips and, when the exit happens during a Hand, that Seat's current Hole Cards and Pot eligibility.
@@ -57,7 +57,7 @@ The human player who creates a Private Room and chooses its table settings befor
 _Avoid_: Owner, admin
 
 **Host Removal**:
-A Host action that immediately converts a human player's Seat into an AI Takeover Seat.
+A Host action that converts a human player's positive-chip Seat into an AI Takeover Seat after the current Hand has settled. A zero-chip Seat is released instead.
 _Avoid_: Ban, chip removal
 
 **Nickname**:
@@ -81,7 +81,7 @@ Virtual chips used only inside a Cash Table to place bets and settle hands; they
 _Avoid_: Money, currency, points
 
 **Rebuy**:
-A behavior where a player with zero Table Chips receives the Private Room's initial Table Chips after the current Hand ends.
+A once-per-Seat behavior where a player with zero Table Chips receives the Private Room's initial Table Chips after the current Hand ends. The Seat retains its Rebuy count when its occupant leaves or is replaced, and a previously used Seat cannot issue additional starting Table Chips to a replacement.
 _Avoid_: Recharge, top-up
 
 **Blind**:

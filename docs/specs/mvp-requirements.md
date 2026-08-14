@@ -23,7 +23,7 @@ Build a deployable web-based Texas Hold'em cash-table game where a human player 
   - seat count;
   - AI count;
   - AI Difficulty: easy, standard, or hard;
-  - initial Table Chips, default 1000;
+  - initial Table Chips, default 1000, between 50 and 200 big blinds;
   - small blind and big blind, default 5/10;
   - Host nickname.
 - Room settings cannot be changed after the room starts.
@@ -45,10 +45,11 @@ Build a deployable web-based Texas Hold'em cash-table game where a human player 
 - Table Chips are virtual entertainment chips only.
 - Table Chips have no real-money value.
 - There is no recharge, withdrawal, purchase, redemption, prize, global ranking reward, or exchangeable value.
-- Players with zero Table Chips can Rebuy after the current Hand ends.
+- Each Seat can Rebuy once after the current Hand ends; its Rebuy count remains with that Seat when a player leaves or a replacement enters.
 - Rebuy amount equals the room's initial Table Chips.
-- Human players may choose to Rebuy.
-- AI Opponents Rebuy automatically.
+- A vacant Seat can receive initial Table Chips only on its first occupation; later entry into that Seat consumes its one unused Rebuy allocation, if any.
+- Human players may choose their one Rebuy; after it is used, a player with zero Table Chips is eliminated and must leave the table.
+- AI Opponents use their one Rebuy automatically, then leave the table when their Table Chips reach zero again.
 
 ## AI
 
@@ -65,8 +66,10 @@ Build a deployable web-based Texas Hold'em cash-table game where a human player 
 
 - Human players take available seats before AI replacement.
 - If the room is full and has an AI Opponent, a new human player can replace an AI Opponent after the current Hand ends.
-- A replacing human player enters with the room's initial Table Chips.
-- A replacing human player does not inherit the AI Opponent's Table Chips.
+- Pending AI Replacements cannot exceed the number of replaceable AI Opponents.
+- An AI Takeover Seat is reserved for its original Temporary Player Identity and cannot be replaced by another player.
+- A Temporary Player Identity can occupy or reserve only one Seat in a Private Room.
+- A replacing human player inherits the replaced AI Opponent's current Table Chips; AI replacement never issues new Table Chips.
 - If the room is full and all seats are occupied by human players, joining is rejected as room full.
 
 ## Exit, Removal, and AI Takeover
@@ -74,12 +77,12 @@ Build a deployable web-based Texas Hold'em cash-table game where a human player 
 - When a human player exits a seat, the seat becomes an AI Takeover Seat.
 - The AI Takeover Seat inherits the seat's current Table Chips.
 - If the exit happens during a Hand, the AI Takeover Seat also inherits that seat's Hole Cards and Pot eligibility.
-- Host Removal also converts the human player's seat into an AI Takeover Seat.
-- If Host Removal targets a player participating in the current Hand, the conversion happens immediately and the AI Takeover Seat continues that Hand.
+- Host Removal converts a positive-chip human seat into an AI Takeover Seat; removing a zero-chip human seat releases it instead.
+- Host Removal is available only after the current Hand has settled.
 - A returning player with the same Temporary Player Identity can reclaim their AI Takeover Seat before Room Expiration.
 - Seat Reclaim inherits the seat's current Table Chips.
 - A new friend cannot reclaim another player's AI Takeover Seat as that player.
-- A new friend replacing any AI uses initial Table Chips instead of inheriting that AI's chips.
+- A new friend replacing an AI inherits that AI's current Table Chips.
 
 ## Reconnect and Room Expiration
 
@@ -124,6 +127,7 @@ Build a deployable web-based Texas Hold'em cash-table game where a human player 
 - All-In is supported.
 - Side Pots are required.
 - Minimum raise should follow standard no-limit rules: at least the size of the previous raise in the same Betting Round.
+- A short All-In may increase the amount to call, but does not reopen betting for players who have already acted.
 - Pots and Side Pots must be settled independently by eligibility.
 
 ## Hand Evaluation
@@ -142,6 +146,7 @@ Build a deployable web-based Texas Hold'em cash-table game where a human player 
 - Ace can be high or low in A-2-3-4-5 straights.
 - The best five-card hand wins.
 - Exact ties split the eligible Pot.
+- When a split Pot cannot be divided evenly, remaining chips are awarded one at a time from the first eligible winner clockwise to the left of the Dealer.
 - Split Pot and Side Pot settlement must both be correct.
 
 ## Card Visibility
